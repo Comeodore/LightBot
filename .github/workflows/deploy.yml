@@ -1,0 +1,35 @@
+name: Deploy LightBot
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy-lightbot:
+    runs-on: self-hosted
+    steps:
+      - name: Update repository
+        run: |
+          cd ~/LightBot
+          git fetch --all
+          git reset --hard origin/main
+
+      - name: Force remove existing container
+        run: docker rm -f lightbot || true
+
+      - name: Build docker image
+        run: docker build -t lightbot:latest ~/LightBot
+
+      - name: Run container
+        run: |
+          docker run -d --name lightbot \
+            --restart unless-stopped \
+            --env-file ~/LightBot/.env \
+            lightbot:latest
+
+      - name: Cleanup old images
+        run: docker image prune -af
+
+      - name: Show logs
+        run: docker logs --tail=50 lightbot
+
