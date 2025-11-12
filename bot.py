@@ -64,30 +64,35 @@ class HomeAssistantClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._message_id = 1
-        self._closing = False
         
     async def connect(self) -> None:
+        await self.close()
+        
         self.session = aiohttp.ClientSession()
-        self.ws = await self.session.ws_connect(
-            self.url,
-            heartbeat=30,
-            timeout=aiohttp.ClientWSTimeout(ws_close=30)
-        )
-        
-        auth_msg = await asyncio.wait_for(self.ws.receive_json(), timeout=10)
-        if auth_msg.get('type') != 'auth_required':
-            raise ConnectionError("Unexpected auth message")
-        
-        await self.ws.send_json({
-            "type": "auth",
-            "access_token": self.token
-        })
-        
-        auth_result = await asyncio.wait_for(self.ws.receive_json(), timeout=10)
-        if auth_result.get('type') != 'auth_ok':
-            raise ConnectionError("Authentication failed")
-        
-        logger.info("✅ Connected to Home Assistant")
+        try:
+            self.ws = await self.session.ws_connect(
+                self.url,
+                heartbeat=30,
+                timeout=aiohttp.ClientWSTimeout(ws_close=30)
+            )
+            
+            auth_msg = await asyncio.wait_for(self.ws.receive_json(), timeout=10)
+            if auth_msg.get('type') != 'auth_required':
+                raise ConnectionError("Unexpected auth message")
+            
+            await self.ws.send_json({
+                "type": "auth",
+                "access_token": self.token
+            })
+            
+            auth_result = await asyncio.wait_for(self.ws.receive_json(), timeout=10)
+            if auth_result.get('type') != 'auth_ok':
+                raise ConnectionError("Authentication failed")
+            
+            logger.info("✅ Connected to Home Assistant")
+        except Exception:
+            await self.close()
+            raise
         
     async def subscribe_events(self) -> None:
         await self._send_message("subscribe_events", event_type="state_changed")
@@ -127,15 +132,17 @@ class HomeAssistantClient:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 yield msg.json()
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                logger.warning("⚠️ WebSocket closed")
                 break
                 
     async def close(self) -> None:
-        self._closing = True
-        if self.ws and not self.ws.closed:
-            await self.ws.close()
-        if self.session and not self.session.closed:
-            await self.session.close()
+        if self.ws:
+            if not self.ws.closed:
+                await self.ws.close()
+            self.ws = None
+        if self.session:
+            if not self.session.closed:
+                await self.session.close()
+            self.session = None
 
 
 class Database:
@@ -218,14 +225,23 @@ class PowerMonitor:
                     await self._initialize_state()
                     await self.ha.subscribe_events()
                     
-                    await self._event_loop()
+                    close_code, close_reason = await self._event_loop()
                     
                     if self._shutdown.is_set():
                         break
+                    
+                    if close_code:
+                        logger.warning(f"⚠️ WebSocket disconnected: code={close_code}, reason={close_reason}")
+                    else:
+                        logger.warning("⚠️ WebSocket disconnected")
+                    logger.info("🔄 Reconnecting in 3 seconds...")
+                    try:
+                        await asyncio.wait_for(self._shutdown.wait(), timeout=3)
+                    except asyncio.TimeoutError:
+                        pass
                         
                 except Exception as e:
                     logger.error(f"❌ Connection error: {e}")
-                    await self.ha.close()
                     
                     if not self._shutdown.is_set():
                         logger.info("🔄 Reconnecting in 3 seconds...")
@@ -255,6 +271,12 @@ class PowerMonitor:
             if self._shutdown.is_set():
                 break
             await self._process_event(event)
+        
+        if self.ha.ws and self.ha.ws.closed:
+            code = self.ha.ws.close_code
+            exception = self.ha.ws.exception()
+            return code, str(exception) if exception else 'Connection closed'
+        return None, None
                 
     async def _process_event(self, event: dict) -> None:
         if event.get('type') != 'event':
@@ -267,7 +289,6 @@ class PowerMonitor:
             new_state = event_data.get('new_state', {})
             battery_level = self._parse_battery_level(new_state)
             self.current_state.battery_level = battery_level
-            logger.info(f"🔋 Battery updated: {battery_level}")
             return
             
         if entity_id != self.config.voltage_entity:
@@ -277,9 +298,8 @@ class PowerMonitor:
         voltage_value = new_state_data.get('state', 'unknown')
         new_power_state = self._parse_power_state(new_state_data)
         
-        logger.info(f"⚡ Voltage: {voltage_value}V -> {new_power_state} (DB state: {self.current_state.state})")
-        
         if self._is_valid_transition(self.current_state.state, new_power_state):
+            logger.info(f"⚡ Voltage: {voltage_value}V -> {new_power_state} (DB state: {self.current_state.state})")
             new_power = PowerState(
                 state=new_power_state,
                 timestamp=datetime.now(timezone.utc),
@@ -304,10 +324,10 @@ class PowerMonitor:
         else:
             message = (
                 f"🔴 **POWER OUTAGE**\n\n"
-                f"⚡️ Power was on for: **{duration}**\n"
+                f"⚡️ Uptime: **{duration}**\n"
                 f"🔋 Battery level: **{new_state.battery_level}**"
             )
-            logger.warning(f"⚠️ Power lost after {duration}")
+            logger.info(f"⚠️ Power lost after {duration}")
             
         await self.notifier.send(message)
         await self.db.save_event(new_state)
