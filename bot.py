@@ -2,7 +2,8 @@ import os
 import asyncio
 import logging
 import signal
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Optional
 from dotenv import load_dotenv
@@ -17,6 +18,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+YASNO_REGION = '25'
+YASNO_DSO = '902'
+YASNO_GROUP = '2.2'
 
 
 @dataclass
@@ -55,6 +61,114 @@ class PowerState:
     
     def is_power_on(self) -> bool:
         return self.state == 'OK'
+
+
+@dataclass
+class TimeSlot:
+    start: int
+    end: int
+    type: str
+    
+    def is_power_off(self) -> bool:
+        return self.type == "Definite"
+    
+    def contains_minute(self, minute: int) -> bool:
+        return self.start <= minute < self.end
+
+
+@dataclass
+class DaySchedule:
+    date: str
+    slots: list[TimeSlot]
+    status: str
+    
+    def get_slot_at_minute(self, minute: int) -> Optional[TimeSlot]:
+        for slot in self.slots:
+            if slot.contains_minute(minute):
+                return slot
+        return None
+    
+    def get_next_transition(self, current_minute: int) -> Optional[tuple[int, bool]]:
+        for slot in self.slots:
+            if slot.end > current_minute:
+                if slot.start > current_minute:
+                    return (slot.start, slot.is_power_off())
+                if slot.end < 1440:
+                    next_slot_idx = self.slots.index(slot) + 1
+                    if next_slot_idx < len(self.slots):
+                        next_slot = self.slots[next_slot_idx]
+                        return (slot.end, next_slot.is_power_off())
+        return None
+
+
+@dataclass
+class YasnoSchedule:
+    today: DaySchedule
+    updated_on: datetime
+    group: str
+
+
+class YasnoAPIClient:
+    BASE_URL = "https://app.yasno.ua/api/blackout-service/public/shutdowns"
+    
+    def __init__(self, region: str, dso: str, group: str):
+        self.region = region
+        self.dso = dso
+        self.group = group
+        self.session: Optional[aiohttp.ClientSession] = None
+        
+    async def connect(self) -> None:
+        if self.session and not self.session.closed:
+            return
+        self.session = aiohttp.ClientSession()
+        
+    async def fetch_schedule(self) -> Optional[YasnoSchedule]:
+        await self.connect()
+        
+        url = f"{self.BASE_URL}/regions/{self.region}/dsos/{self.dso}/planned-outages"
+        
+        try:
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
+                    logger.error(f"❌ Yasno API error: {response.status}")
+                    return None
+                    
+                data = await response.json()
+                
+                if self.group not in data:
+                    logger.error(f"❌ Group {self.group} not found in response")
+                    return None
+                    
+                group_data = data[self.group]
+                
+                today_data = group_data.get('today', {})
+                updated_on_str = group_data.get('updatedOn')
+                
+                if not updated_on_str:
+                    logger.error("❌ Missing updatedOn in response")
+                    return None
+                
+                today = DaySchedule(
+                    date=today_data.get('date', ''),
+                    slots=[TimeSlot(**slot) for slot in today_data.get('slots', [])],
+                    status=today_data.get('status', '')
+                )
+                
+                updated_on = datetime.fromisoformat(updated_on_str.replace('Z', '+00:00'))
+                
+                return YasnoSchedule(
+                    today=today,
+                    updated_on=updated_on,
+                    group=self.group
+                )
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch Yasno schedule: {e}")
+            return None
+            
+    async def close(self) -> None:
+        if self.session and not self.session.closed:
+            await self.session.close()
 
 
 class HomeAssistantClient:
@@ -171,6 +285,38 @@ class Database:
             )
         logger.info(f"💾 Saved: {state.state} at {state.timestamp}")
         
+    async def get_yasno_schedule(self) -> Optional[dict]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT updated_on, schedule_data "
+                "FROM yasno_schedule WHERE id = 1"
+            )
+            if row:
+                schedule_data = row['schedule_data']
+                if isinstance(schedule_data, str):
+                    schedule_data = json.loads(schedule_data)
+                return {
+                    'updated_on': row['updated_on'],
+                    'schedule_data': schedule_data
+                }
+            return None
+            
+    async def save_yasno_schedule(
+        self, 
+        updated_on: datetime, 
+        schedule_data: dict
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE yasno_schedule 
+                SET updated_on = $1,
+                    schedule_data = $2
+                WHERE id = 1
+                """,
+                updated_on, json.dumps(schedule_data)
+            )
+        
     async def close(self) -> None:
         if self.pool:
             await self.pool.close()
@@ -202,12 +348,152 @@ class NotificationService:
         await self.app.shutdown()
 
 
+class YasnoScheduleMonitor:
+    def __init__(
+        self,
+        yasno_client: YasnoAPIClient,
+        db: Database,
+        notifier: NotificationService,
+        power_monitor: 'PowerMonitor'
+    ):
+        self.yasno = yasno_client
+        self.db = db
+        self.notifier = notifier
+        self.power_monitor = power_monitor
+        self._shutdown = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+        
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._monitor_loop())
+        logger.info("📅 Yasno schedule monitor started")
+        
+    async def stop(self) -> None:
+        self._shutdown.set()
+        if self._task:
+            await self._task
+        
+    async def _monitor_loop(self) -> None:
+        await asyncio.sleep(5)
+        
+        while not self._shutdown.is_set():
+            try:
+                await self._check_schedule()
+            except Exception as e:
+                logger.error(f"❌ Error checking Yasno schedule: {e}")
+            
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
+                
+    async def _check_schedule(self) -> None:
+        schedule = await self.yasno.fetch_schedule()
+        if not schedule:
+            return
+            
+        now = datetime.now(timezone.utc)
+        kyiv_offset = timedelta(hours=2)
+        now_kyiv = now + kyiv_offset
+        
+        current_minute = now_kyiv.hour * 60 + now_kyiv.minute
+        
+        next_event = self._find_next_event(schedule, now_kyiv, current_minute)
+        
+        saved_schedule = await self.db.get_yasno_schedule()
+        
+        if saved_schedule:
+            saved_updated_on = saved_schedule['updated_on']
+            
+            if schedule.updated_on > saved_updated_on:
+                logger.info(f"📅 Schedule updated: {saved_updated_on} -> {schedule.updated_on}")
+                
+                saved_next_event = None
+                if saved_schedule['schedule_data']:
+                    saved_today_data = saved_schedule['schedule_data'].get('today', {})
+                    if saved_today_data.get('slots'):
+                        saved_day_schedule = DaySchedule(
+                            date=saved_today_data.get('date', ''),
+                            slots=[TimeSlot(**slot) for slot in saved_today_data['slots']],
+                            status=saved_today_data.get('status', '')
+                        )
+                        saved_transition = saved_day_schedule.get_next_transition(current_minute)
+                        if saved_transition:
+                            saved_minute, saved_is_outage = saved_transition
+                            saved_next_time = now_kyiv.replace(hour=saved_minute // 60, minute=saved_minute % 60, second=0, microsecond=0)
+                            saved_next_event = (saved_next_time, saved_is_outage)
+                
+                if next_event and self.power_monitor.current_state:
+                    next_time, is_outage = next_event
+                    
+                    event_changed = False
+                    if saved_next_event is None:
+                        event_changed = True
+                    else:
+                        saved_next_time, saved_is_outage = saved_next_event
+                        if next_time != saved_next_time or is_outage != saved_is_outage:
+                            event_changed = True
+                    
+                    if event_changed:
+                        power_is_on = self.power_monitor.current_state.is_power_on()
+                        
+                        should_notify = False
+                        if power_is_on and is_outage:
+                            event_type = "outage"
+                            should_notify = True
+                        elif not power_is_on and not is_outage:
+                            event_type = "connection"
+                            should_notify = True
+                        
+                        if should_notify:
+                            time_str = next_time.strftime("%H:%M")
+                            
+                            message = (
+                                f"📅 **Schedule updated**\n\n"
+                                f"Next {event_type}: **{time_str}**"
+                            )
+                            
+                            await self.notifier.send(message)
+                            logger.info(f"📅 Sent schedule update notification: {event_type} at {time_str}")
+                        else:
+                            logger.info(f"📅 Schedule updated but next event doesn't match current power state (power={'ON' if power_is_on else 'OFF'}, next_is_outage={is_outage})")
+        
+        schedule_data = {
+            'today': {
+                'date': schedule.today.date,
+                'status': schedule.today.status,
+                'slots': [{'start': s.start, 'end': s.end, 'type': s.type} for s in schedule.today.slots]
+            }
+        }
+        
+        await self.db.save_yasno_schedule(
+            schedule.updated_on,
+            schedule_data
+        )
+    
+    def _find_next_event(
+        self, 
+        schedule: YasnoSchedule, 
+        now_kyiv: datetime, 
+        current_minute: int
+    ) -> Optional[tuple[datetime, bool]]:
+        next_transition = schedule.today.get_next_transition(current_minute)
+        
+        if next_transition:
+            minute, is_outage = next_transition
+            next_time = now_kyiv.replace(hour=minute // 60, minute=minute % 60, second=0, microsecond=0)
+            return (next_time, is_outage)
+        
+        return None
+
+
 class PowerMonitor:
     def __init__(self, config: Config):
         self.config = config
         self.ha = HomeAssistantClient(config.ws_url, config.ha_token)
         self.db = Database(config.database_url)
         self.notifier = NotificationService(config.bot_token, config.chat_ids)
+        self.yasno = YasnoAPIClient(YASNO_REGION, YASNO_DSO, YASNO_GROUP)
+        self.yasno_monitor: Optional[YasnoScheduleMonitor] = None
         self.current_state: Optional[PowerState] = None
         self._shutdown = asyncio.Event()
         
@@ -217,6 +503,14 @@ class PowerMonitor:
         
         await self.db.connect()
         await self.notifier.start()
+        
+        self.yasno_monitor = YasnoScheduleMonitor(
+            self.yasno,
+            self.db,
+            self.notifier,
+            self
+        )
+        await self.yasno_monitor.start()
         
         try:
             while not self._shutdown.is_set():
@@ -314,12 +608,16 @@ class PowerMonitor:
     async def _handle_state_change(self, new_state: PowerState) -> None:
         duration = self._format_duration(self.current_state.timestamp, new_state.timestamp)
         
+        next_event_info = await self._get_next_event_info(new_state.is_power_on())
+        
         if new_state.is_power_on():
             message = (
                 f"🟢 **POWER RESTORED**\n\n"
                 f"⏳ Outage duration: **{duration}**\n"
                 f"🔋 Battery level: **{new_state.battery_level}**"
             )
+            if next_event_info:
+                message += f"\n\n{next_event_info}"
             logger.info(f"✅ Power restored after {duration}")
         else:
             message = (
@@ -327,11 +625,42 @@ class PowerMonitor:
                 f"⚡️ Uptime: **{duration}**\n"
                 f"🔋 Battery level: **{new_state.battery_level}**"
             )
+            if next_event_info:
+                message += f"\n\n{next_event_info}"
             logger.info(f"⚠️ Power lost after {duration}")
             
         await self.notifier.send(message)
         await self.db.save_event(new_state)
         self.current_state = new_state
+    
+    async def _get_next_event_info(self, power_is_on: bool) -> Optional[str]:
+        try:
+            schedule = await self.yasno.fetch_schedule()
+            if not schedule:
+                return None
+            
+            now = datetime.now(timezone.utc)
+            kyiv_offset = timedelta(hours=2)
+            now_kyiv = now + kyiv_offset
+            current_minute = now_kyiv.hour * 60 + now_kyiv.minute
+            
+            next_transition = schedule.today.get_next_transition(current_minute)
+            
+            if next_transition:
+                minute, is_outage = next_transition
+                
+                if power_is_on and is_outage:
+                    time_str = f"{minute // 60:02d}:{minute % 60:02d}"
+                    return f"📅 Next outage: **{time_str}**"
+                elif not power_is_on and not is_outage:
+                    time_str = f"{minute // 60:02d}:{minute % 60:02d}"
+                    return f"📅 Next connection: **{time_str}**"
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting next event info: {e}")
+            return None
         
     def _parse_power_state(self, state: dict) -> str:
         try:
@@ -366,6 +695,9 @@ class PowerMonitor:
         
     async def _cleanup(self) -> None:
         logger.info("🧹 Cleaning up...")
+        if self.yasno_monitor:
+            await self.yasno_monitor.stop()
+        await self.yasno.close()
         await self.ha.close()
         await self.db.close()
         await self.notifier.stop()
