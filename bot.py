@@ -464,17 +464,29 @@ class NotificationService:
             logger.error(f"❌ Failed to start notification service: {e}")
             raise
         
-    async def send(self, message: str) -> None:
+    async def send(self, message: str, pin: bool = False) -> None:
         for chat_id in self.chat_ids:
             for attempt in range(self.MAX_RETRIES):
                 try:
-                    await self.app.bot.send_message(
+                    sent_message = await self.app.bot.send_message(
                         chat_id=chat_id,
                         text=message,
                         parse_mode='Markdown',
                         disable_web_page_preview=True
                     )
                     logger.info(f"📤 Message sent to {chat_id}")
+                    
+                    if pin:
+                        try:
+                            await self.app.bot.pin_chat_message(
+                                chat_id=chat_id,
+                                message_id=sent_message.message_id,
+                                disable_notification=True
+                            )
+                            logger.info(f"📌 Message pinned in {chat_id}")
+                        except Exception as pin_error:
+                            logger.warning(f"⚠️ Failed to pin message in {chat_id}: {pin_error}")
+                    
                     break
                 except Exception as e:
                     if attempt < self.MAX_RETRIES - 1:
@@ -586,11 +598,14 @@ class YasnoScheduleMonitor:
         try:
             logger.info(f"📅 Schedule updated: {saved_schedule['updated_on']} -> {schedule.updated_on}")
             
-            saved_next_event = None
             schedule_data = saved_schedule.get('schedule_data')
+            saved_tomorrow_status = None
+            saved_next_event = None
+            
             if schedule_data:
                 saved_today_data = schedule_data.get('today', {})
                 saved_tomorrow_data = schedule_data.get('tomorrow', {})
+                saved_tomorrow_status = saved_tomorrow_data.get('status') if saved_tomorrow_data else None
                 
                 if saved_today_data.get('slots'):
                     saved_today = DaySchedule(
@@ -616,7 +631,16 @@ class YasnoScheduleMonitor:
                     
                     saved_next_event = self._find_next_event(saved_schedule_obj, now_kyiv, current_minute)
             
-            if next_event and self.power_monitor.current_state:
+            tomorrow_updated = (
+                schedule.tomorrow and
+                schedule.tomorrow.status == "ScheduleApplies" and
+                saved_tomorrow_status != "ScheduleApplies"
+            )
+            
+            if tomorrow_updated:
+                await self._handle_tomorrow_update(schedule, now_kyiv, current_minute)
+            
+            if next_event and self.power_monitor.current_state and not tomorrow_updated:
                 next_time, is_outage = next_event
                 
                 event_changed = (
@@ -649,6 +673,57 @@ class YasnoScheduleMonitor:
                                   f"(power={'ON' if power_is_on else 'OFF'}, next_is_outage={is_outage})")
         except Exception as e:
             logger.error(f"❌ Error handling schedule update: {e}")
+    
+    async def _handle_tomorrow_update(
+        self,
+        schedule: YasnoSchedule,
+        now_kyiv: datetime,
+        current_minute: int
+    ) -> None:
+        outage_slots = [
+            slot for slot in schedule.tomorrow.slots
+            if slot.is_power_off()
+        ]
+        
+        if not outage_slots:
+            return
+        
+        outage_lines = []
+        for slot in outage_slots:
+            start_time = f"{slot.start // 60:02d}:{slot.start % 60:02d}"
+            end_time = f"{slot.end // 60:02d}:{slot.end % 60:02d}"
+            outage_lines.append(f"{start_time} - {end_time}")
+        
+        schedule_message = (
+            f"📅 **Tomorrow schedule updated**\n\n"
+            + "\n".join(outage_lines)
+        )
+        
+        await self.notifier.send(schedule_message, pin=True)
+        logger.info(f"📅 Sent tomorrow schedule update with {len(outage_slots)} outage slots")
+        
+        current_slot = schedule.today.get_slot_at_minute(current_minute)
+        if not current_slot:
+            return
+        
+        first_tomorrow_slot = schedule.tomorrow.slots[0]
+        if first_tomorrow_slot.start != 0:
+            return
+        
+        if current_slot.type == first_tomorrow_slot.type:
+            if len(schedule.tomorrow.slots) > 1:
+                next_slot = schedule.tomorrow.slots[1]
+                time_str = f"{first_tomorrow_slot.end // 60:02d}:{first_tomorrow_slot.end % 60:02d}"
+                
+                if self.power_monitor.current_state:
+                    power_is_on = self.power_monitor.current_state.is_power_on()
+                    
+                    if (power_is_on and next_slot.is_power_off()) or (not power_is_on and not next_slot.is_power_off()):
+                        event_type = "outage" if next_slot.is_power_off() else "connection"
+                        
+                        next_message = f"📅 Next {event_type}: **{time_str}**"
+                        await self.notifier.send(next_message)
+                        logger.info(f"📅 Sent next event notification: {event_type} at {time_str}")
     
     async def _save_schedule(self, schedule: YasnoSchedule) -> None:
         schedule_data = {
