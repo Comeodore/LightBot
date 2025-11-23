@@ -561,22 +561,7 @@ class YasnoScheduleMonitor:
             if saved_schedule:
                 saved_updated_on = saved_schedule['updated_on']
                 
-                saved_today_date = None
-                schedule_data = saved_schedule.get('schedule_data')
-                if schedule_data:
-                    saved_today_data = schedule_data.get('today', {})
-                    if saved_today_data.get('date'):
-                        saved_today_date = saved_today_data['date'][:10]
-                
-                current_today_date = schedule.today.date[:10] if schedule.today.date else None
-                
-                is_new_day = saved_today_date and current_today_date and saved_today_date != current_today_date
-                is_schedule_updated = schedule.updated_on > saved_updated_on
-                
-                if is_new_day:
-                    logger.info(f"📅 New day detected: {saved_today_date} -> {current_today_date}, updating database")
-                
-                if is_schedule_updated and not is_new_day:
+                if schedule.updated_on > saved_updated_on:
                     await self._handle_schedule_update(
                         schedule,
                         saved_schedule,
@@ -929,6 +914,9 @@ class PowerMonitor:
                     return f"📅 Next outage: **{time_str}**"
                 else:
                     return f"📅 Next connection: **{time_str}**"
+            
+            if power_is_on:
+                return "✅ No more outages scheduled for today"
             
             return None
             
