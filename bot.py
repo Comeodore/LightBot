@@ -599,13 +599,11 @@ class YasnoScheduleMonitor:
             logger.info(f"📅 Schedule updated: {saved_schedule['updated_on']} -> {schedule.updated_on}")
             
             schedule_data = saved_schedule.get('schedule_data')
-            saved_tomorrow_status = None
             saved_next_event = None
             
             if schedule_data:
                 saved_today_data = schedule_data.get('today', {})
                 saved_tomorrow_data = schedule_data.get('tomorrow', {})
-                saved_tomorrow_status = saved_tomorrow_data.get('status') if saved_tomorrow_data else None
                 
                 if saved_today_data.get('slots'):
                     saved_today = DaySchedule(
@@ -631,46 +629,66 @@ class YasnoScheduleMonitor:
                     
                     saved_next_event = self._find_next_event(saved_schedule_obj, now_kyiv, current_minute)
             
+            if schedule.today.status == "EmergencyShutdowns":
+                message = (
+                    f"🚨 **Emergency shutdowns in effect**\n\n"
+                    f"Scheduled outages are cancelled"
+                )
+                await self.notifier.send(message)
+                logger.info("🚨 Sent emergency shutdowns notification")
+                return
+            
             tomorrow_updated = (
                 schedule.tomorrow and
                 schedule.tomorrow.status == "ScheduleApplies" and
-                saved_tomorrow_status != "ScheduleApplies"
+                schedule_data and
+                schedule_data.get('tomorrow', {}).get('status') != "ScheduleApplies"
             )
             
             if tomorrow_updated:
                 await self._handle_tomorrow_update(schedule, now_kyiv, current_minute)
             
-            if next_event and self.power_monitor.current_state and not tomorrow_updated:
-                next_time, is_outage = next_event
+            if self.power_monitor.current_state and not tomorrow_updated:
+                power_is_on = self.power_monitor.current_state.is_power_on()
                 
-                event_changed = (
-                    saved_next_event is None or
-                    saved_next_event[0] != next_time or
-                    saved_next_event[1] != is_outage
-                )
-                
-                if event_changed:
-                    power_is_on = self.power_monitor.current_state.is_power_on()
+                if next_event:
+                    next_time, is_outage = next_event
                     
-                    should_notify = (
-                        (power_is_on and is_outage) or
-                        (not power_is_on and not is_outage)
+                    event_changed = (
+                        saved_next_event is None or
+                        saved_next_event[0] != next_time or
+                        saved_next_event[1] != is_outage
                     )
                     
-                    if should_notify:
-                        event_type = "outage" if is_outage else "connection"
-                        time_str = next_time.strftime("%H:%M")
-                        
-                        message = (
-                            f"📅 **Schedule updated**\n\n"
-                            f"Next {event_type}: **{time_str}**"
+                    if event_changed:
+                        should_notify = (
+                            (power_is_on and is_outage) or
+                            (not power_is_on and not is_outage)
                         )
                         
-                        await self.notifier.send(message)
-                        logger.info(f"📅 Sent schedule update notification: {event_type} at {time_str}")
-                    else:
-                        logger.info(f"📅 Schedule updated but next event doesn't match current power state "
-                                  f"(power={'ON' if power_is_on else 'OFF'}, next_is_outage={is_outage})")
+                        if should_notify:
+                            event_type = "outage" if is_outage else "connection"
+                            time_str = next_time.strftime("%H:%M")
+                            
+                            message = (
+                                f"📅 **Schedule updated**\n\n"
+                                f"Next {event_type}: **{time_str}**"
+                            )
+                            
+                            await self.notifier.send(message)
+                            logger.info(f"📅 Sent schedule update notification: {event_type} at {time_str}")
+                        else:
+                            logger.info(f"📅 Schedule updated but next event doesn't match current power state "
+                                      f"(power={'ON' if power_is_on else 'OFF'}, next_is_outage={is_outage})")
+                
+                elif saved_next_event and power_is_on:
+                    message = (
+                        f"📅 **Schedule updated**\n\n"
+                        f"✅ No more outages scheduled for today"
+                    )
+                    
+                    await self.notifier.send(message)
+                    logger.info("📅 Sent schedule update: outage cancelled, no more outages today")
         except Exception as e:
             logger.error(f"❌ Error handling schedule update: {e}")
     
@@ -688,19 +706,32 @@ class YasnoScheduleMonitor:
         if not outage_slots:
             return
         
+        total_outage_minutes = sum(slot.end - slot.start for slot in outage_slots)
+        total_power_minutes = MINUTES_IN_DAY - total_outage_minutes
+        
+        outage_hours = total_outage_minutes // 60
+        outage_mins = total_outage_minutes % 60
+        power_hours = total_power_minutes // 60
+        power_mins = total_power_minutes % 60
+        
         outage_lines = []
         for slot in outage_slots:
             start_time = f"{slot.start // 60:02d}:{slot.start % 60:02d}"
             end_time = f"{slot.end // 60:02d}:{slot.end % 60:02d}"
             outage_lines.append(f"{start_time} - {end_time}")
         
+        outage_duration = f"{outage_hours}h {outage_mins}m" if outage_mins else f"{outage_hours}h"
+        power_duration = f"{power_hours}h {power_mins}m" if power_mins else f"{power_hours}h"
+        
         schedule_message = (
             f"📅 **Tomorrow schedule updated**\n\n"
             + "\n".join(outage_lines)
+            + f"\n\n⚡️ Power: **{power_duration}**\n"
+            + f"🔴 Outages: **{outage_duration}**"
         )
         
         await self.notifier.send(schedule_message, pin=True)
-        logger.info(f"📅 Sent tomorrow schedule update with {len(outage_slots)} outage slots")
+        logger.info(f"📅 Sent tomorrow schedule update with {len(outage_slots)} outage slots ({outage_duration} total)")
         
         current_slot = schedule.today.get_slot_at_minute(current_minute)
         if not current_slot:
@@ -792,19 +823,7 @@ class YasnoScheduleMonitor:
                     next_time = tomorrow_date.replace(hour=0, minute=0, second=0, microsecond=0)
                     return (next_time, first_tomorrow_slot.is_power_off())
         
-        if current_slot.end == MINUTES_IN_DAY:
-            tomorrow_date = now_kyiv + timedelta(days=1)
-            next_time = tomorrow_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        else:
-            next_time = now_kyiv.replace(
-                hour=current_slot.end // 60,
-                minute=current_slot.end % 60,
-                second=0,
-                microsecond=0
-            )
-        
-        is_next_outage = not current_slot.is_power_off()
-        return (next_time, is_next_outage)
+        return None
 
 
 class PowerMonitor:
@@ -975,6 +994,9 @@ class PowerMonitor:
             schedule = await self.yasno.fetch_schedule()
             if not schedule:
                 return None
+            
+            if schedule.today.status == "EmergencyShutdowns":
+                return "🚨 Emergency shutdowns in effect"
             
             now_kyiv = datetime.now(KYIV_TZ)
             current_minute = now_kyiv.hour * 60 + now_kyiv.minute
