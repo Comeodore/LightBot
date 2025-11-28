@@ -123,8 +123,10 @@ class YasnoAPIClient:
         self.session: Optional[aiohttp.ClientSession] = None
         
     async def connect(self) -> None:
-        if self.session and not self.session.closed:
-            return
+        if self.session:
+            if not self.session.closed:
+                return
+            await self.close()
         
         timeout = aiohttp.ClientTimeout(total=self.REQUEST_TIMEOUT)
         connector = aiohttp.TCPConnector(limit=10, limit_per_host=5, ttl_dns_cache=300)
@@ -161,21 +163,32 @@ class YasnoAPIClient:
                         logger.error("❌ Missing updatedOn in response")
                         return None
                     
-                    today = DaySchedule(
-                        date=today_data.get('date', ''),
-                        slots=tuple(TimeSlot(**slot) for slot in today_data.get('slots', [])),
-                        status=today_data.get('status', '')
-                    )
+                    try:
+                        today = DaySchedule(
+                            date=today_data.get('date', ''),
+                            slots=tuple(TimeSlot(**slot) for slot in today_data.get('slots', [])),
+                            status=today_data.get('status', '')
+                        )
+                    except (TypeError, KeyError) as e:
+                        logger.error(f"❌ Failed to parse today schedule: {e}")
+                        return None
                     
                     tomorrow = None
                     if tomorrow_data and tomorrow_data.get('slots'):
-                        tomorrow = DaySchedule(
-                            date=tomorrow_data.get('date', ''),
-                            slots=tuple(TimeSlot(**slot) for slot in tomorrow_data.get('slots', [])),
-                            status=tomorrow_data.get('status', '')
-                        )
+                        try:
+                            tomorrow = DaySchedule(
+                                date=tomorrow_data.get('date', ''),
+                                slots=tuple(TimeSlot(**slot) for slot in tomorrow_data.get('slots', [])),
+                                status=tomorrow_data.get('status', '')
+                            )
+                        except (TypeError, KeyError) as e:
+                            logger.warning(f"⚠️ Failed to parse tomorrow schedule: {e}")
                     
-                    updated_on = datetime.fromisoformat(updated_on_str.replace('Z', '+00:00'))
+                    try:
+                        updated_on = datetime.fromisoformat(updated_on_str.replace('Z', '+00:00'))
+                    except (ValueError, AttributeError) as e:
+                        logger.error(f"❌ Failed to parse updated_on timestamp: {e}")
+                        return None
                     
                     return YasnoSchedule(
                         today=today,
@@ -218,6 +231,8 @@ class HomeAssistantClient:
         
     async def connect(self) -> None:
         await self.close()
+        
+        self._message_id = 1
         
         timeout = aiohttp.ClientTimeout(total=60)
         connector = aiohttp.TCPConnector(limit=10, keepalive_timeout=30)
@@ -401,7 +416,11 @@ class Database:
                 if row:
                     schedule_data = row['schedule_data']
                     if isinstance(schedule_data, str):
-                        schedule_data = json.loads(schedule_data)
+                        try:
+                            schedule_data = json.loads(schedule_data)
+                        except json.JSONDecodeError as e:
+                            logger.error(f"❌ Failed to parse schedule JSON: {e}")
+                            return None
                     return {
                         'updated_on': row['updated_on'],
                         'schedule_data': schedule_data
@@ -420,16 +439,24 @@ class Database:
             raise RuntimeError("Database pool not initialized")
         
         try:
+            schedule_json = json.dumps(schedule_data)
+        except (TypeError, ValueError) as e:
+            logger.error(f"❌ Failed to serialize schedule data: {e}")
+            raise
+        
+        try:
             async with self.pool.acquire() as conn:
-                await conn.execute(
+                result = await conn.execute(
                     """
                     UPDATE yasno_schedule 
                     SET updated_on = $1,
                         schedule_data = $2
                     WHERE id = 1
                     """,
-                    updated_on, json.dumps(schedule_data)
+                    updated_on, schedule_json
                 )
+                if result == "UPDATE 0":
+                    logger.warning("⚠️ No rows updated in yasno_schedule table")
         except Exception as e:
             logger.error(f"❌ Failed to save yasno schedule: {e}")
             raise
@@ -463,8 +490,25 @@ class NotificationService:
         except Exception as e:
             logger.error(f"❌ Failed to start notification service: {e}")
             raise
+    
+    async def unpin_all_messages(self) -> None:
+        for chat_id in self.chat_ids:
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    await self.app.bot.unpin_all_chat_messages(chat_id=chat_id)
+                    logger.info(f"📍 All messages unpinned in {chat_id}")
+                    break
+                except Exception as e:
+                    if attempt < self.MAX_RETRIES - 1:
+                        logger.warning(f"⚠️ Failed to unpin messages in {chat_id} (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}")
+                        await asyncio.sleep(self.RETRY_DELAY)
+                    else:
+                        logger.warning(f"⚠️ Failed to unpin messages in {chat_id} after {self.MAX_RETRIES} attempts: {e}")
         
-    async def send(self, message: str, pin: bool = False) -> None:
+    async def send(self, message: str, pin: bool = False, unpin_all_first: bool = False) -> None:
+        if unpin_all_first:
+            await self.unpin_all_messages()
+        
         for chat_id in self.chat_ids:
             for attempt in range(self.MAX_RETRIES):
                 try:
@@ -606,28 +650,31 @@ class YasnoScheduleMonitor:
                 saved_tomorrow_data = schedule_data.get('tomorrow', {})
                 
                 if saved_today_data.get('slots'):
-                    saved_today = DaySchedule(
-                        date=saved_today_data.get('date', ''),
-                        slots=tuple(TimeSlot(**slot) for slot in saved_today_data['slots']),
-                        status=saved_today_data.get('status', '')
-                    )
-                    
-                    saved_tomorrow = None
-                    if saved_tomorrow_data and saved_tomorrow_data.get('slots'):
-                        saved_tomorrow = DaySchedule(
-                            date=saved_tomorrow_data.get('date', ''),
-                            slots=tuple(TimeSlot(**slot) for slot in saved_tomorrow_data['slots']),
-                            status=saved_tomorrow_data.get('status', '')
+                    try:
+                        saved_today = DaySchedule(
+                            date=saved_today_data.get('date', ''),
+                            slots=tuple(TimeSlot(**slot) for slot in saved_today_data['slots']),
+                            status=saved_today_data.get('status', '')
                         )
-                    
-                    saved_schedule_obj = YasnoSchedule(
-                        today=saved_today,
-                        tomorrow=saved_tomorrow,
-                        updated_on=saved_schedule['updated_on'],
-                        group=YASNO_GROUP
-                    )
-                    
-                    saved_next_event = self._find_next_event(saved_schedule_obj, now_kyiv, current_minute)
+                        
+                        saved_tomorrow = None
+                        if saved_tomorrow_data and saved_tomorrow_data.get('slots'):
+                            saved_tomorrow = DaySchedule(
+                                date=saved_tomorrow_data.get('date', ''),
+                                slots=tuple(TimeSlot(**slot) for slot in saved_tomorrow_data['slots']),
+                                status=saved_tomorrow_data.get('status', '')
+                            )
+                        
+                        saved_schedule_obj = YasnoSchedule(
+                            today=saved_today,
+                            tomorrow=saved_tomorrow,
+                            updated_on=saved_schedule['updated_on'],
+                            group=YASNO_GROUP
+                        )
+                        
+                        saved_next_event = self._find_next_event(saved_schedule_obj, now_kyiv, current_minute)
+                    except (TypeError, KeyError) as e:
+                        logger.warning(f"⚠️ Failed to parse saved schedule: {e}")
             
             if schedule.today.status == "EmergencyShutdowns":
                 message = (
@@ -698,12 +745,17 @@ class YasnoScheduleMonitor:
         now_kyiv: datetime,
         current_minute: int
     ) -> None:
+        if not schedule.tomorrow or not schedule.tomorrow.slots:
+            logger.warning("⚠️ Tomorrow schedule update called but no tomorrow data available")
+            return
+        
         outage_slots = [
             slot for slot in schedule.tomorrow.slots
             if slot.is_power_off()
         ]
         
         if not outage_slots:
+            logger.info("📅 Tomorrow has no outage slots")
             return
         
         total_outage_minutes = sum(slot.end - slot.start for slot in outage_slots)
@@ -730,7 +782,7 @@ class YasnoScheduleMonitor:
             + f"🔴 Outages: **{outage_duration}**"
         )
         
-        await self.notifier.send(schedule_message, pin=True)
+        await self.notifier.send(schedule_message, pin=True, unpin_all_first=True)
         logger.info(f"📅 Sent tomorrow schedule update with {len(outage_slots)} outage slots ({outage_duration} total)")
         
         current_slot = schedule.today.get_slot_at_minute(current_minute)
@@ -929,6 +981,10 @@ class PowerMonitor:
     async def _process_event(self, event: dict) -> None:
         if event.get('type') != 'event':
             return
+        
+        if not self.current_state:
+            logger.warning("⚠️ Current state not initialized, skipping event")
+            return
             
         event_data = event.get('event', {}).get('data', {})
         entity_id = event_data.get('entity_id')
@@ -1084,7 +1140,10 @@ class PowerMonitor:
         
     def _parse_power_state(self, state: dict) -> str:
         try:
-            voltage = float(state.get('state', 0))
+            voltage_value = state.get('state', 0)
+            if voltage_value in ('unavailable', 'unknown', None):
+                raise ValueError(f"Voltage state unavailable: {voltage_value}")
+            voltage = float(voltage_value)
             return 'OK' if voltage > 0 else 'ALARM'
         except (ValueError, TypeError) as e:
             raise ValueError(f"Failed to parse voltage: {e}") from e
@@ -1093,7 +1152,10 @@ class PowerMonitor:
         if not state:
             return "N/A"
         try:
-            return f"{round(float(state.get('state')))}%"
+            battery_value = state.get('state')
+            if battery_value is None or battery_value == 'unavailable' or battery_value == 'unknown':
+                return "N/A"
+            return f"{round(float(battery_value))}%"
         except (ValueError, TypeError):
             return "N/A"
             
