@@ -1020,6 +1020,10 @@ class PowerMonitor:
     async def _handle_state_change(self, new_state: PowerState) -> None:
         duration = self._format_duration(self.current_state.timestamp, new_state.timestamp)
         
+        is_unplanned_outage = False
+        if not new_state.is_power_on():
+            is_unplanned_outage = await self._check_if_unplanned_outage()
+        
         next_event_info = await self._get_next_event_info(new_state.is_power_on())
         
         if new_state.is_power_on():
@@ -1037,13 +1041,67 @@ class PowerMonitor:
                 f"⚡️ Uptime: **{duration}**\n"
                 f"🔋 Battery level: **{new_state.battery_level}**"
             )
-            if next_event_info:
-                message += f"\n\n{next_event_info}"
-            logger.info(f"⚠️ Power lost after {duration}")
+            
+            if is_unplanned_outage:
+                message += "\n\n⚠️ **Unscheduled outage**"
+                logger.info(f"⚠️ Power lost (UNSCHEDULED) after {duration}")
+            else:
+                if next_event_info:
+                    message += f"\n\n{next_event_info}"
+                logger.info(f"⚠️ Power lost after {duration}")
             
         await self.notifier.send(message)
         await self.db.save_event(new_state)
         self.current_state = new_state
+    
+    async def _check_if_unplanned_outage(self) -> bool:
+        try:
+            schedule = await self.yasno.fetch_schedule()
+            if not schedule:
+                return False
+            
+            if schedule.today.status == "EmergencyShutdowns":
+                return False
+            
+            if not schedule.today.slots:
+                return False
+            
+            now_kyiv = datetime.now(KYIV_TZ)
+            current_minute = now_kyiv.hour * 60 + now_kyiv.minute
+            
+            current_slot = schedule.today.get_slot_at_minute(current_minute)
+            if current_slot and current_slot.is_power_off():
+                return False
+            
+            next_outage_minute = None
+            for slot in schedule.today.slots:
+                if slot.start > current_minute and slot.is_power_off():
+                    next_outage_minute = slot.start
+                    break
+            
+            if next_outage_minute is None:
+                if (schedule.tomorrow and 
+                    schedule.tomorrow.status == "ScheduleApplies" and 
+                    schedule.tomorrow.slots):
+                    for slot in schedule.tomorrow.slots:
+                        if slot.is_power_off():
+                            next_outage_minute = MINUTES_IN_DAY + slot.start
+                            break
+            
+            if next_outage_minute is None:
+                return True
+            
+            minutes_until_outage = next_outage_minute - current_minute
+            
+            if minutes_until_outage > 60:
+                logger.info(f"🔍 Unplanned outage detected: next scheduled outage in {minutes_until_outage} minutes")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error checking if unplanned outage: {e}")
+            return False
     
     async def _get_next_event_info(self, power_is_on: bool) -> Optional[str]:
         try:
