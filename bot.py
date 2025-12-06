@@ -504,7 +504,38 @@ class NotificationService:
                         await asyncio.sleep(self.RETRY_DELAY)
                     else:
                         logger.warning(f"⚠️ Failed to unpin messages in {chat_id} after {self.MAX_RETRIES} attempts: {e}")
-        
+    
+    async def edit_pinned_message(self, message: str) -> None:
+        for chat_id in self.chat_ids:
+            try:
+                chat = await self.app.bot.get_chat(chat_id)
+                if not chat.pinned_message:
+                    logger.warning(f"⚠️ No pinned message found in {chat_id}, skipping edit")
+                    continue
+                
+                message_id = chat.pinned_message.message_id
+                logger.info(f"📌 Found pinned message in {chat_id}: {message_id}")
+                
+                for attempt in range(self.MAX_RETRIES):
+                    try:
+                        await self.app.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=message,
+                            parse_mode='Markdown',
+                            disable_web_page_preview=True
+                        )
+                        logger.info(f"✏️ Pinned message edited in {chat_id}")
+                        break
+                    except Exception as e:
+                        if attempt < self.MAX_RETRIES - 1:
+                            logger.warning(f"⚠️ Failed to edit message in {chat_id} (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}")
+                            await asyncio.sleep(self.RETRY_DELAY)
+                        else:
+                            logger.error(f"❌ Failed to edit message in {chat_id} after {self.MAX_RETRIES} attempts: {e}")
+            except Exception as e:
+                logger.error(f"❌ Failed to get chat info for {chat_id}: {e}")
+    
     async def send(self, message: str, pin: bool = False, unpin_all_first: bool = False) -> None:
         if unpin_all_first:
             await self.unpin_all_messages()
@@ -694,6 +725,8 @@ class YasnoScheduleMonitor:
             
             if tomorrow_updated:
                 await self._handle_tomorrow_update(schedule, now_kyiv, current_minute)
+            elif schedule.tomorrow and schedule.tomorrow.status == "WaitingForSchedule":
+                await self._handle_today_update(schedule, now_kyiv, current_minute)
             
             if self.power_monitor.current_state and not tomorrow_updated:
                 power_is_on = self.power_monitor.current_state.is_power_on()
@@ -738,6 +771,64 @@ class YasnoScheduleMonitor:
                     logger.info("📅 Sent schedule update: outage cancelled, no more outages today")
         except Exception as e:
             logger.error(f"❌ Error handling schedule update: {e}")
+    
+    async def _handle_today_update(
+        self,
+        schedule: YasnoSchedule,
+        now_kyiv: datetime,
+        current_minute: int
+    ) -> None:
+        try:
+            if schedule.today.status == "EmergencyShutdowns":
+                logger.info("📅 Today schedule updated but emergency shutdowns in effect - not updating pinned message")
+                return
+            
+            if not schedule.today.slots:
+                logger.info("📅 Today schedule updated but no slots available - not updating pinned message")
+                return
+            
+            outage_slots = [
+                slot for slot in schedule.today.slots
+                if slot.is_power_off()
+            ]
+            
+            if not outage_slots:
+                schedule_message = (
+                    f"📅 **Today schedule updated**\n\n"
+                    f"✅ No outages scheduled for today"
+                )
+                await self.notifier.edit_pinned_message(schedule_message)
+                logger.info("📅 Updated today schedule - no outages")
+                return
+            
+            total_outage_minutes = sum(slot.end - slot.start for slot in outage_slots)
+            total_power_minutes = MINUTES_IN_DAY - total_outage_minutes
+            
+            outage_hours = total_outage_minutes // 60
+            outage_mins = total_outage_minutes % 60
+            power_hours = total_power_minutes // 60
+            power_mins = total_power_minutes % 60
+            
+            outage_lines = []
+            for slot in outage_slots:
+                start_time = f"{slot.start // 60:02d}:{slot.start % 60:02d}"
+                end_time = f"{slot.end // 60:02d}:{slot.end % 60:02d}"
+                outage_lines.append(f"{start_time} - {end_time}")
+            
+            outage_duration = f"{outage_hours}h {outage_mins}m" if outage_mins else f"{outage_hours}h"
+            power_duration = f"{power_hours}h {power_mins}m" if power_mins else f"{power_hours}h"
+            
+            schedule_message = (
+                f"📅 **Today schedule updated**\n\n"
+                + "\n".join(outage_lines)
+                + f"\n\n⚡️ Power: **{power_duration}**\n"
+                + f"🔴 Outages: **{outage_duration}**"
+            )
+            
+            await self.notifier.edit_pinned_message(schedule_message)
+            logger.info(f"📅 Updated today schedule with {len(outage_slots)} outage slots ({outage_duration} total)")
+        except Exception as e:
+            logger.error(f"❌ Error handling today update: {e}")
     
     async def _handle_tomorrow_update(
         self,
@@ -886,8 +977,8 @@ class PowerMonitor:
         self.config = config
         self.ha = HomeAssistantClient(config.ws_url, config.ha_token)
         self.db = Database(config.database_url)
-        self.notifier = NotificationService(config.bot_token, config.chat_ids)
         self.yasno = YasnoAPIClient(YASNO_REGION, YASNO_DSO, YASNO_GROUP)
+        self.notifier = NotificationService(config.bot_token, config.chat_ids)
         self.yasno_monitor: Optional[YasnoScheduleMonitor] = None
         self.current_state: Optional[PowerState] = None
         self._shutdown = asyncio.Event()
