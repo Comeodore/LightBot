@@ -740,7 +740,7 @@ class YasnoScheduleMonitor:
             
             if schedule.today.status == "EmergencyShutdowns":
                 message = (
-                    f"🚨 **Emergency shutdowns in effect**\n\n"
+                    f"🚨 **Emergency shutdowns**\n\n"
                     f"Scheduled outages are cancelled"
                 )
                 await self.notifier.send(message)
@@ -818,7 +818,8 @@ class YasnoScheduleMonitor:
             outage_lines = []
             for slot in outage_slots:
                 start_time = f"{slot.start // 60:02d}:{slot.start % 60:02d}"
-                end_time = f"{slot.end // 60:02d}:{slot.end % 60:02d}"
+                end_h, end_m = (0, 0) if slot.end == MINUTES_IN_DAY else (slot.end // 60, slot.end % 60)
+                end_time = f"{end_h:02d}:{end_m:02d}"
                 outage_lines.append(f"{start_time} - {end_time}")
             
             outage_duration = f"{outage_hours}h {outage_mins}m" if outage_mins else f"{outage_hours}h"
@@ -906,7 +907,8 @@ class YasnoScheduleMonitor:
         outage_lines = []
         for slot in outage_slots:
             start_time = f"{slot.start // 60:02d}:{slot.start % 60:02d}"
-            end_time = f"{slot.end // 60:02d}:{slot.end % 60:02d}"
+            end_h, end_m = (0, 0) if slot.end == MINUTES_IN_DAY else (slot.end // 60, slot.end % 60)
+            end_time = f"{end_h:02d}:{end_m:02d}"
             outage_lines.append(f"{start_time} - {end_time}")
         
         outage_duration = f"{outage_hours}h {outage_mins}m" if outage_mins else f"{outage_hours}h"
@@ -1046,12 +1048,15 @@ class YasnoScheduleMonitor:
                 second=0,
                 microsecond=0
             )
-            end_time = now_kyiv.replace(
-                hour=today_outage.end // 60,
-                minute=today_outage.end % 60,
-                second=0,
-                microsecond=0
-            )
+            if today_outage.end == MINUTES_IN_DAY:
+                end_time = (now_kyiv + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            else:
+                end_time = now_kyiv.replace(
+                    hour=today_outage.end // 60,
+                    minute=today_outage.end % 60,
+                    second=0,
+                    microsecond=0
+                )
             return (start_time, end_time, False)
         
         if tomorrow_outage:
@@ -1062,12 +1067,15 @@ class YasnoScheduleMonitor:
                 second=0,
                 microsecond=0
             )
-            end_time = tomorrow_date.replace(
-                hour=tomorrow_outage.end // 60,
-                minute=tomorrow_outage.end % 60,
-                second=0,
-                microsecond=0
-            )
+            if tomorrow_outage.end == MINUTES_IN_DAY:
+                end_time = (tomorrow_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            else:
+                end_time = tomorrow_date.replace(
+                    hour=tomorrow_outage.end // 60,
+                    minute=tomorrow_outage.end % 60,
+                    second=0,
+                    microsecond=0
+                )
             return (start_time, end_time, False)
         
         return None
@@ -1393,6 +1401,15 @@ class PowerMonitor:
             if power_is_on:
                 return "✅ No more outages scheduled for today"
             
+            if not power_is_on and (not schedule.tomorrow or schedule.tomorrow.status == "WaitingForSchedule"):
+                current_slot = schedule.today.get_slot_at_minute(current_minute)
+                if current_slot and current_slot.is_power_off():
+                    if current_slot.end == MINUTES_IN_DAY:
+                        return "📅 Next connection: **00:00**"
+                    else:
+                        end_time = f"{current_slot.end // 60:02d}:{current_slot.end % 60:02d}"
+                        return f"📅 Next connection: **{end_time}**"
+            
             return None
             
         except Exception as e:
@@ -1437,11 +1454,10 @@ class PowerMonitor:
             schedule.tomorrow.status == "ScheduleApplies" and 
             schedule.tomorrow.slots):
             
+            tomorrow_date = now_kyiv + timedelta(days=1)
             first_tomorrow_slot = schedule.tomorrow.slots[0]
             
             if first_tomorrow_slot.start == 0:
-                tomorrow_date = now_kyiv + timedelta(days=1)
-                
                 if current_slot.type == first_tomorrow_slot.type:
                     if len(schedule.tomorrow.slots) > 1:
                         next_slot = schedule.tomorrow.slots[1]
@@ -1457,6 +1473,16 @@ class PowerMonitor:
                     if (power_is_on and first_tomorrow_slot.is_power_off()) or (not power_is_on and not first_tomorrow_slot.is_power_off()):
                         next_time = tomorrow_date.replace(hour=0, minute=0, second=0, microsecond=0)
                         return (next_time, first_tomorrow_slot.is_power_off())
+            
+            for slot in schedule.tomorrow.slots:
+                if (power_is_on and slot.is_power_off()) or (not power_is_on and not slot.is_power_off()):
+                    next_time = tomorrow_date.replace(
+                        hour=slot.start // 60,
+                        minute=slot.start % 60,
+                        second=0,
+                        microsecond=0
+                    )
+                    return (next_time, slot.is_power_off())
         
         return None
         
