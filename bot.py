@@ -738,14 +738,27 @@ class YasnoScheduleMonitor:
                     except (TypeError, KeyError) as e:
                         logger.warning(f"⚠️ Failed to parse saved schedule: {e}")
             
+            saved_today_status = schedule_data.get('today', {}).get('status', '') if schedule_data else ''
+            
             if schedule.today.status == "EmergencyShutdowns":
+                if saved_today_status != "EmergencyShutdowns":
+                    message = (
+                        f"🚨 **Emergency shutdowns**\n\n"
+                        f"Scheduled outages are cancelled"
+                    )
+                    await self.notifier.send(message)
+                    logger.info("🚨 Sent emergency shutdowns notification")
+                else:
+                    logger.info("🚨 Emergency shutdowns still in effect, skipping notification")
+                return
+            
+            if saved_today_status == "EmergencyShutdowns" and schedule.today.status != "EmergencyShutdowns":
                 message = (
-                    f"🚨 **Emergency shutdowns**\n\n"
-                    f"Scheduled outages are cancelled"
+                    f"✅ **Emergency shutdowns ended**\n\n"
+                    f"Scheduled outages are active now"
                 )
                 await self.notifier.send(message)
-                logger.info("🚨 Sent emergency shutdowns notification")
-                return
+                logger.info("✅ Sent emergency shutdowns ended notification")
             
             tomorrow_updated = (
                 schedule.tomorrow and
