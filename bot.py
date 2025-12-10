@@ -760,129 +760,148 @@ class YasnoScheduleMonitor:
                 await self.notifier.send(message)
                 logger.info("✅ Sent emergency shutdowns ended notification")
             
-            tomorrow_updated = (
+            tomorrow_published = (
                 schedule.tomorrow and
                 schedule.tomorrow.status == "ScheduleApplies" and
                 schedule_data and
                 schedule_data.get('tomorrow', {}).get('status') != "ScheduleApplies"
             )
             
-            if tomorrow_updated:
+            tomorrow_is_active = (
+                schedule.tomorrow and
+                schedule.tomorrow.status == "ScheduleApplies"
+            )
+            
+            if tomorrow_published:
                 await self._handle_tomorrow_update(schedule, saved_schedule, now_kyiv, current_minute)
-            elif schedule.tomorrow and schedule.tomorrow.status == "WaitingForSchedule":
-                await self._handle_today_update(schedule, saved_schedule, now_kyiv, current_minute)
+            else:
+                await self._update_pinned_schedule(schedule, saved_schedule, now_kyiv, current_minute, use_tomorrow=tomorrow_is_active)
         except Exception as e:
             logger.error(f"❌ Error handling schedule update: {e}")
     
-    async def _handle_today_update(
+    async def _update_pinned_schedule(
         self,
         schedule: YasnoSchedule,
         saved_schedule: dict,
         now_kyiv: datetime,
-        current_minute: int
+        current_minute: int,
+        use_tomorrow: bool = False
     ) -> None:
         try:
-            if schedule.today.status == "EmergencyShutdowns":
+            day_schedule = schedule.tomorrow if use_tomorrow else schedule.today
+            day_label = "tomorrow" if use_tomorrow else "today"
+            
+            if not day_schedule or not day_schedule.slots:
+                logger.info(f"📅 {day_label.capitalize()} schedule update but no slots available")
+                return
+            
+            if not use_tomorrow and schedule.today.status == "EmergencyShutdowns":
                 logger.info("📅 Today schedule updated but emergency shutdowns in effect - not updating pinned message")
                 return
             
-            if not schedule.today.slots:
-                logger.info("📅 Today schedule updated but no slots available - not updating pinned message")
-                return
-            
             schedule_data = saved_schedule.get('schedule_data') if saved_schedule else None
-            saved_today_data = schedule_data.get('today', {}) if schedule_data else {}
-            saved_today_slots = saved_today_data.get('slots', [])
+            saved_day_key = 'tomorrow' if use_tomorrow else 'today'
+            saved_day_data = schedule_data.get(saved_day_key, {}) if schedule_data else {}
+            saved_slots = saved_day_data.get('slots', [])
             
-            current_today_slots = [
+            current_slots = [
                 {'start': s.start, 'end': s.end, 'type': s.type}
-                for s in schedule.today.slots
+                for s in day_schedule.slots
             ]
             
-            if saved_today_slots == current_today_slots:
-                logger.info("📅 Today schedule unchanged, skipping update")
-                return
+            slots_changed = saved_slots != current_slots
             
             outage_slots = [
-                slot for slot in schedule.today.slots
+                slot for slot in day_schedule.slots
                 if slot.is_power_off()
             ]
             
-            date_str = now_kyiv.strftime("%d.%m")
+            if use_tomorrow:
+                date_str = (now_kyiv + timedelta(days=1)).strftime("%d.%m")
+            else:
+                date_str = now_kyiv.strftime("%d.%m")
             
             if not outage_slots:
                 schedule_message = (
                     f"📅 **{date_str} schedule**\n\n"
                     f"✅ No outages scheduled"
                 )
-                await self.notifier.edit_pinned_message(schedule_message)
-                await self._send_schedule_change_notification(schedule, now_kyiv, current_minute)
-                logger.info("📅 Updated today schedule - no outages")
-                return
-            
-            total_outage_minutes = sum(slot.end - slot.start for slot in outage_slots)
-            total_power_minutes = MINUTES_IN_DAY - total_outage_minutes
-            
-            outage_hours = total_outage_minutes // 60
-            outage_mins = total_outage_minutes % 60
-            power_hours = total_power_minutes // 60
-            power_mins = total_power_minutes % 60
-            
-            outage_lines = []
-            for slot in outage_slots:
-                start_time = f"{slot.start // 60:02d}:{slot.start % 60:02d}"
-                end_h, end_m = (0, 0) if slot.end == MINUTES_IN_DAY else (slot.end // 60, slot.end % 60)
-                end_time = f"{end_h:02d}:{end_m:02d}"
-                outage_lines.append(f"{start_time} - {end_time}")
-            
-            outage_duration = f"{outage_hours}h {outage_mins}m" if outage_mins else f"{outage_hours}h"
-            power_duration = f"{power_hours}h {power_mins}m" if power_mins else f"{power_hours}h"
-            
-            schedule_message = (
-                f"📅 **{date_str} schedule**\n\n"
-                + "\n".join(outage_lines)
-                + f"\n\n⚡️ Power: **{power_duration}**\n"
-                + f"🔴 Outages: **{outage_duration}**"
-            )
+            else:
+                total_outage_minutes = sum(slot.end - slot.start for slot in outage_slots)
+                total_power_minutes = MINUTES_IN_DAY - total_outage_minutes
+                
+                outage_hours = total_outage_minutes // 60
+                outage_mins = total_outage_minutes % 60
+                power_hours = total_power_minutes // 60
+                power_mins = total_power_minutes % 60
+                
+                outage_lines = []
+                for slot in outage_slots:
+                    start_time = f"{slot.start // 60:02d}:{slot.start % 60:02d}"
+                    end_h, end_m = (0, 0) if slot.end == MINUTES_IN_DAY else (slot.end // 60, slot.end % 60)
+                    end_time = f"{end_h:02d}:{end_m:02d}"
+                    outage_lines.append(f"{start_time} - {end_time}")
+                
+                outage_duration = f"{outage_hours}h {outage_mins}m" if outage_mins else f"{outage_hours}h"
+                power_duration = f"{power_hours}h {power_mins}m" if power_mins else f"{power_hours}h"
+                
+                schedule_message = (
+                    f"📅 **{date_str} schedule**\n\n"
+                    + "\n".join(outage_lines)
+                    + f"\n\n⚡️ Power: **{power_duration}**\n"
+                    + f"🔴 Outages: **{outage_duration}**"
+                )
             
             await self.notifier.edit_pinned_message(schedule_message)
-            await self._send_schedule_change_notification(schedule, now_kyiv, current_minute)
-            logger.info(f"📅 Updated today schedule with {len(outage_slots)} outage slots ({outage_duration} total)")
+            logger.info(f"📅 Updated pinned with {day_label} schedule ({date_str})")
+            
+            if slots_changed:
+                current_next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
+                saved_next_outage = self._get_saved_next_outage_slot(saved_schedule, now_kyiv, current_minute)
+                
+                next_slot_changed = self._outage_slots_differ(current_next_outage, saved_next_outage)
+                
+                if next_slot_changed:
+                    await self._send_schedule_change_notification(schedule, now_kyiv, current_minute, is_tomorrow=use_tomorrow)
+                else:
+                    logger.info(f"📅 {day_label.capitalize()} schedule changed but next outage slot unchanged, skipping notification")
         except Exception as e:
-            logger.error(f"❌ Error handling today update: {e}")
+            logger.error(f"❌ Error updating pinned schedule: {e}")
     
     async def _send_schedule_change_notification(
         self,
         schedule: YasnoSchedule,
         now_kyiv: datetime,
-        current_minute: int
+        current_minute: int,
+        is_tomorrow: bool = False
     ) -> None:
         try:
+            day_label = "Tomorrow" if is_tomorrow else "Today"
             next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
             
             if not next_outage:
                 message = (
-                    f"📅 **Today schedule updated**\n\n"
+                    f"📅 **{day_label} schedule updated**\n\n"
                     f"✅ No more outages scheduled"
                 )
                 await self.notifier.send_reply_to_pinned(message)
-                logger.info("📅 Sent schedule change notification: no more outages")
+                logger.info(f"📅 Sent {day_label.lower()} schedule change notification: no more outages")
                 return
             
             start_time, end_time, _ = next_outage
             start_str = start_time.strftime("%H:%M")
             end_str = end_time.strftime("%H:%M")
             
-            is_tomorrow = start_time.date() > now_kyiv.date()
-            day_prefix = "tomorrow " if is_tomorrow else ""
+            is_tomorrow_slot = start_time.date() > now_kyiv.date()
+            day_prefix = "tomorrow " if is_tomorrow_slot else ""
             
             message = (
-                f"📅 **Today schedule updated**\n\n"
+                f"📅 **{day_label} schedule updated**\n\n"
                 f"Next outage: **{day_prefix}{start_str} - {end_str}**"
             )
             
             await self.notifier.send_reply_to_pinned(message)
-            logger.info(f"📅 Sent schedule change notification: {day_prefix}{start_str} - {end_str}")
+            logger.info(f"📅 Sent {day_label.lower()} schedule change notification: {day_prefix}{start_str} - {end_str}")
         except Exception as e:
             logger.error(f"❌ Error sending schedule change notification: {e}")
     
@@ -1092,6 +1111,67 @@ class YasnoScheduleMonitor:
             return (start_time, end_time, False)
         
         return None
+    
+    def _get_saved_next_outage_slot(
+        self,
+        saved_schedule: dict,
+        now_kyiv: datetime,
+        current_minute: int
+    ) -> Optional[tuple[datetime, datetime, bool]]:
+        if not saved_schedule:
+            return None
+        
+        schedule_data = saved_schedule.get('schedule_data')
+        if not schedule_data:
+            return None
+        
+        try:
+            saved_today_data = schedule_data.get('today', {})
+            saved_tomorrow_data = schedule_data.get('tomorrow', {})
+            
+            if not saved_today_data.get('slots'):
+                return None
+            
+            saved_today = DaySchedule(
+                date=saved_today_data.get('date', ''),
+                slots=tuple(TimeSlot(**slot) for slot in saved_today_data['slots']),
+                status=saved_today_data.get('status', '')
+            )
+            
+            saved_tomorrow = None
+            if saved_tomorrow_data and saved_tomorrow_data.get('slots'):
+                saved_tomorrow = DaySchedule(
+                    date=saved_tomorrow_data.get('date', ''),
+                    slots=tuple(TimeSlot(**slot) for slot in saved_tomorrow_data['slots']),
+                    status=saved_tomorrow_data.get('status', '')
+                )
+            
+            saved_schedule_obj = YasnoSchedule(
+                today=saved_today,
+                tomorrow=saved_tomorrow,
+                updated_on=saved_schedule.get('updated_on', datetime.now(timezone.utc)),
+                group=YASNO_GROUP
+            )
+            
+            return self._find_next_outage_slot(saved_schedule_obj, now_kyiv, current_minute)
+        except (TypeError, KeyError) as e:
+            logger.warning(f"⚠️ Failed to parse saved schedule: {e}")
+            return None
+    
+    def _outage_slots_differ(
+        self,
+        slot1: Optional[tuple[datetime, datetime, bool]],
+        slot2: Optional[tuple[datetime, datetime, bool]]
+    ) -> bool:
+        if slot1 is None and slot2 is None:
+            return False
+        if slot1 is None or slot2 is None:
+            return True
+        
+        start1, end1, _ = slot1
+        start2, end2, _ = slot2
+        
+        return start1 != start2 or end1 != end2
     
     async def _save_schedule(self, schedule: YasnoSchedule) -> None:
         schedule_data = {
