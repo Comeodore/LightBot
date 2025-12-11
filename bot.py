@@ -1415,9 +1415,13 @@ class PowerMonitor:
                     message += f"\n\n{next_event_info}"
                 logger.info(f"⚠️ Power lost after {duration}")
             
-        await self.notifier.send(message)
-        await self.db.save_event(new_state)
         self.current_state = new_state
+        await self.notifier.send(message)
+        
+        try:
+            await self.db.save_event(new_state)
+        except Exception as e:
+            logger.error(f"❌ Failed to save event to DB: {e}")
     
     async def _check_if_unplanned_outage(self) -> bool:
         try:
