@@ -811,6 +811,10 @@ class YasnoScheduleMonitor:
             
             slots_changed = saved_slots != current_slots
             
+            if not slots_changed:
+                logger.debug(f"📅 {day_label.capitalize()} slots unchanged, skipping pinned message update")
+                return
+            
             outage_slots = [
                 slot for slot in day_schedule.slots
                 if slot.is_power_off()
@@ -855,53 +859,87 @@ class YasnoScheduleMonitor:
             await self.notifier.edit_pinned_message(schedule_message)
             logger.info(f"📅 Updated pinned with {day_label} schedule ({date_str})")
             
-            if slots_changed:
-                current_next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
-                saved_next_outage = self._get_saved_next_outage_slot(saved_schedule, now_kyiv, current_minute)
-                
-                next_slot_changed = self._outage_slots_differ(current_next_outage, saved_next_outage)
-                
-                if next_slot_changed:
-                    await self._send_schedule_change_notification(schedule, now_kyiv, current_minute, is_tomorrow=use_tomorrow)
-                else:
-                    logger.info(f"📅 {day_label.capitalize()} schedule changed but next outage slot unchanged, skipping notification")
+            current_next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
+            saved_next_outage = self._get_saved_next_outage_slot(saved_schedule, now_kyiv, current_minute)
+            
+            next_slot_changed = self._outage_slots_differ(current_next_outage, saved_next_outage)
+            
+            saved_outage_minutes = self._calc_outage_minutes(saved_slots)
+            current_outage_minutes = sum(s.end - s.start for s in outage_slots)
+            
+            await self._send_schedule_change_notification(
+                schedule, now_kyiv, current_minute,
+                is_tomorrow=use_tomorrow,
+                next_slot_changed=next_slot_changed,
+                old_outage_minutes=saved_outage_minutes,
+                new_outage_minutes=current_outage_minutes
+            )
         except Exception as e:
             logger.error(f"❌ Error updating pinned schedule: {e}")
+    
+    def _calc_outage_minutes(self, slots: list) -> int:
+        total = 0
+        for slot in slots:
+            if slot.get('type') == 'Definite':
+                total += slot.get('end', 0) - slot.get('start', 0)
+        return total
+    
+    def _format_duration_hours(self, minutes: int) -> str:
+        hours = minutes // 60
+        mins = minutes % 60
+        return f"{hours}h {mins}m" if mins else f"{hours}h"
     
     async def _send_schedule_change_notification(
         self,
         schedule: YasnoSchedule,
         now_kyiv: datetime,
         current_minute: int,
-        is_tomorrow: bool = False
+        is_tomorrow: bool = False,
+        next_slot_changed: bool = True,
+        old_outage_minutes: int = 0,
+        new_outage_minutes: int = 0
     ) -> None:
         try:
             day_label = "Tomorrow" if is_tomorrow else "Today"
-            next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
             
-            if not next_outage:
+            if next_slot_changed:
+                next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
+                
+                if not next_outage:
+                    message = (
+                        f"📅 **{day_label} schedule updated**\n\n"
+                        f"✅ No more outages scheduled"
+                    )
+                    await self.notifier.send_reply_to_pinned(message)
+                    logger.info(f"📅 Sent {day_label.lower()} schedule change notification: no more outages")
+                    return
+                
+                start_time, end_time, _ = next_outage
+                start_str = start_time.strftime("%H:%M")
+                end_str = end_time.strftime("%H:%M")
+                
+                is_tomorrow_slot = start_time.date() > now_kyiv.date()
+                day_prefix = "tomorrow " if is_tomorrow_slot else ""
+                
                 message = (
                     f"📅 **{day_label} schedule updated**\n\n"
-                    f"✅ No more outages scheduled"
+                    f"Next outage: **{day_prefix}{start_str} - {end_str}**"
                 )
+                
                 await self.notifier.send_reply_to_pinned(message)
-                logger.info(f"📅 Sent {day_label.lower()} schedule change notification: no more outages")
-                return
-            
-            start_time, end_time, _ = next_outage
-            start_str = start_time.strftime("%H:%M")
-            end_str = end_time.strftime("%H:%M")
-            
-            is_tomorrow_slot = start_time.date() > now_kyiv.date()
-            day_prefix = "tomorrow " if is_tomorrow_slot else ""
-            
-            message = (
-                f"📅 **{day_label} schedule updated**\n\n"
-                f"Next outage: **{day_prefix}{start_str} - {end_str}**"
-            )
-            
-            await self.notifier.send_reply_to_pinned(message)
-            logger.info(f"📅 Sent {day_label.lower()} schedule change notification: {day_prefix}{start_str} - {end_str}")
+                logger.info(f"📅 Sent {day_label.lower()} schedule change notification: {day_prefix}{start_str} - {end_str}")
+            else:
+                old_duration = self._format_duration_hours(old_outage_minutes)
+                new_duration = self._format_duration_hours(new_outage_minutes)
+                
+                message = (
+                    f"📅 **{day_label} schedule updated**\n\n"
+                    f"Next outage slot unchanged\n"
+                    f"Outage duration: **{old_duration}** → **{new_duration}**"
+                )
+                
+                await self.notifier.send_reply_to_pinned(message)
+                logger.info(f"📅 Sent {day_label.lower()} schedule change notification: {old_duration} -> {new_duration}")
         except Exception as e:
             logger.error(f"❌ Error sending schedule change notification: {e}")
     
@@ -1488,11 +1526,19 @@ class PowerMonitor:
             
             if next_event:
                 next_time, is_outage = next_event
-                time_str = next_time.strftime("%H:%M")
                 
                 if is_outage:
-                    return f"📅 Next outage: **{time_str}**"
+                    next_outage = self.yasno_monitor._find_next_outage_slot(schedule, now_kyiv, current_minute) if self.yasno_monitor else None
+                    if next_outage:
+                        start_time, end_time, _ = next_outage
+                        start_str = start_time.strftime("%H:%M")
+                        end_str = end_time.strftime("%H:%M")
+                        return f"📅 Next outage: **{start_str}-{end_str}**"
+                    else:
+                        time_str = next_time.strftime("%H:%M")
+                        return f"📅 Next outage: **{time_str}**"
                 else:
+                    time_str = next_time.strftime("%H:%M")
                     return f"📅 Next connection: **{time_str}**"
             
             if power_is_on:
