@@ -875,7 +875,7 @@ class YasnoScheduleMonitor:
             saved_next_outage = self._get_saved_next_outage_slot(saved_schedule, now_kyiv, current_minute)
 
             if not self._outage_slots_differ(current_next_outage, saved_next_outage):
-                logger.debug("📅 Next outage slot unchanged after today update")
+                logger.debug("📅 Today slots changed but next outage unchanged, skipping notification")
                 return
 
             if not current_next_outage:
@@ -887,23 +887,14 @@ class YasnoScheduleMonitor:
                 start_time, end_time, is_merged = current_next_outage
                 start_str = start_time.strftime("%H:%M")
                 end_str = end_time.strftime("%H:%M")
-
                 is_tomorrow_slot = start_time.date() > now_kyiv.date()
                 day_prefix = "tomorrow " if is_tomorrow_slot else ""
 
-                if is_merged:
-                    message = (
-                        f"📅 **Today schedule updated**\n\n"
-                        f"Current outage extended: **{start_str} - {day_prefix}{end_str}**"
-                    )
-                else:
-                    message = (
-                        f"📅 **Today schedule updated**\n\n"
-                        f"Next outage: **{day_prefix}{start_str} - {end_str}**"
-                    )
+                slot_info = f"Current outage extended: **{start_str} - {day_prefix}{end_str}**" if is_merged else f"Next outage: **{day_prefix}{start_str} - {end_str}**"
+                message = f"📅 **Today schedule updated**\n\n{slot_info}"
 
             await self.notifier.send(message)
-            logger.info(f"📅 Sent today schedule change notification")
+            logger.info("📅 Sent today schedule change notification")
         except Exception as e:
             logger.error(f"❌ Error checking today changes: {e}")
 
@@ -1088,77 +1079,92 @@ class YasnoScheduleMonitor:
         self,
         schedule: YasnoSchedule,
         now_kyiv: datetime,
-        current_minute: int
+        current_minute: int,
+        skip_current: bool = False
     ) -> Optional[tuple[datetime, datetime, bool]]:
-        today_outage = None
+        today_outage = self._find_relevant_outage(schedule.today.slots, current_minute, skip_current)
+        
         tomorrow_outage = None
-
-        for slot in schedule.today.slots:
-            if slot.is_power_off() and slot.start > current_minute:
-                today_outage = slot
-                break
-
         if schedule.tomorrow and schedule.tomorrow.status == ScheduleStatus.SCHEDULE_APPLIES.value:
-            for slot in schedule.tomorrow.slots:
-                if slot.is_power_off():
-                    tomorrow_outage = slot
-                    break
+            tomorrow_outage = next((s for s in schedule.tomorrow.slots if s.is_power_off()), None)
 
         if today_outage and tomorrow_outage:
             if today_outage.end == MINUTES_IN_DAY and tomorrow_outage.start == 0:
-                start_time = now_kyiv.replace(
-                    hour=today_outage.start // 60,
-                    minute=today_outage.start % 60,
-                    second=0,
-                    microsecond=0
-                )
-                tomorrow_date = now_kyiv + timedelta(days=1)
-                end_time = tomorrow_date.replace(
-                    hour=tomorrow_outage.end // 60,
-                    minute=tomorrow_outage.end % 60,
-                    second=0,
-                    microsecond=0
-                )
-                return (start_time, end_time, True)
+                return self._build_cross_midnight_slot(today_outage, tomorrow_outage, now_kyiv)
 
         if today_outage:
-            start_time = now_kyiv.replace(
-                hour=today_outage.start // 60,
-                minute=today_outage.start % 60,
-                second=0,
-                microsecond=0
-            )
-            if today_outage.end == MINUTES_IN_DAY:
-                end_time = (now_kyiv + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            else:
-                end_time = now_kyiv.replace(
-                    hour=today_outage.end // 60,
-                    minute=today_outage.end % 60,
-                    second=0,
-                    microsecond=0
-                )
-            return (start_time, end_time, False)
+            return self._build_slot_times(today_outage, now_kyiv, is_tomorrow=False)
 
         if tomorrow_outage:
-            tomorrow_date = now_kyiv + timedelta(days=1)
-            start_time = tomorrow_date.replace(
-                hour=tomorrow_outage.start // 60,
-                minute=tomorrow_outage.start % 60,
+            return self._build_slot_times(tomorrow_outage, now_kyiv, is_tomorrow=True)
+
+        return None
+
+    def _find_relevant_outage(
+        self,
+        slots: tuple[TimeSlot, ...],
+        current_minute: int,
+        skip_current: bool = False
+    ) -> Optional[TimeSlot]:
+        for slot in slots:
+            if not slot.is_power_off():
+                continue
+            if slot.end <= current_minute:
+                continue
+            if skip_current and slot.start <= current_minute:
+                continue
+            return slot
+        return None
+
+    def _build_slot_times(
+        self,
+        slot: TimeSlot,
+        now_kyiv: datetime,
+        is_tomorrow: bool
+    ) -> tuple[datetime, datetime, bool]:
+        base_date = (now_kyiv + timedelta(days=1)) if is_tomorrow else now_kyiv
+        
+        start_time = base_date.replace(
+            hour=slot.start // 60,
+            minute=slot.start % 60,
+            second=0,
+            microsecond=0
+        )
+        
+        if slot.end == MINUTES_IN_DAY:
+            end_time = (base_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            end_time = base_date.replace(
+                hour=slot.end // 60,
+                minute=slot.end % 60,
                 second=0,
                 microsecond=0
             )
-            if tomorrow_outage.end == MINUTES_IN_DAY:
-                end_time = (tomorrow_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            else:
-                end_time = tomorrow_date.replace(
-                    hour=tomorrow_outage.end // 60,
-                    minute=tomorrow_outage.end % 60,
-                    second=0,
-                    microsecond=0
-                )
-            return (start_time, end_time, False)
+        
+        return (start_time, end_time, False)
 
-        return None
+    def _build_cross_midnight_slot(
+        self,
+        today_slot: TimeSlot,
+        tomorrow_slot: TimeSlot,
+        now_kyiv: datetime
+    ) -> tuple[datetime, datetime, bool]:
+        start_time = now_kyiv.replace(
+            hour=today_slot.start // 60,
+            minute=today_slot.start % 60,
+            second=0,
+            microsecond=0
+        )
+        
+        tomorrow_date = now_kyiv + timedelta(days=1)
+        end_time = tomorrow_date.replace(
+            hour=tomorrow_slot.end // 60,
+            minute=tomorrow_slot.end % 60,
+            second=0,
+            microsecond=0
+        )
+        
+        return (start_time, end_time, True)
 
     def _get_saved_next_outage_slot(
         self,
@@ -1519,7 +1525,7 @@ class PowerMonitor:
                 next_time, is_outage = next_event
 
                 if is_outage:
-                    next_outage = self.yasno_monitor._find_next_outage_slot(schedule, now_kyiv, current_minute) if self.yasno_monitor else None
+                    next_outage = self.yasno_monitor._find_next_outage_slot(schedule, now_kyiv, current_minute, skip_current=power_is_on) if self.yasno_monitor else None
                     if next_outage:
                         start_time, end_time, _ = next_outage
                         start_str = start_time.strftime("%H:%M")
