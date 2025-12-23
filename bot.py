@@ -129,7 +129,7 @@ class DaySchedule:
 
     @classmethod
     def from_dict(cls, data: dict) -> Optional['DaySchedule']:
-        if not data or not data.get('slots'):
+        if not data or 'slots' not in data:
             return None
         try:
             return cls(
