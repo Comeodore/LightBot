@@ -418,7 +418,7 @@ class Database:
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO power_events (state, timestamp) VALUES ($1, $2)",
+                    "UPDATE power_events SET state = $1, timestamp = $2 WHERE id = 1",
                     state.state, state.timestamp
                 )
             logger.info(f"💾 Saved: {state.state} at {state.timestamp}")
