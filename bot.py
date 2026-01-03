@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import signal
@@ -27,23 +28,166 @@ class PowerStatus(Enum):
     ALARM = "ALARM"
 
 
-class ScheduleStatus(Enum):
-    SCHEDULE_APPLIES = "ScheduleApplies"
-    EMERGENCY_SHUTDOWNS = "EmergencyShutdowns"
-    WAITING_FOR_SCHEDULE = "WaitingForSchedule"
+class DtekCellStatus(Enum):
+    POWER_ON = "power_on"
+    POWER_OFF = "power_off"
+    POWER_OFF_FIRST_30 = "power_off_first_30"
+    POWER_OFF_SECOND_30 = "power_off_second_30"
 
 
-class SlotType(Enum):
-    DEFINITE = "Definite"
-    POSSIBLE = "Possible"
+class DtekOutageStatus(Enum):
+    POWER_ON = "power_on"
+    SCHEDULED = "scheduled"
+    EMERGENCY = "emergency"
 
 
-YASNO_REGION: str = '25'
-YASNO_DSO: str = '902'
-YASNO_GROUP: str = '2.2'
 KYIV_TZ: ZoneInfo = ZoneInfo('Europe/Kyiv')
 MINUTES_IN_DAY: int = 1440
 UNPLANNED_OUTAGE_THRESHOLD_MINUTES: int = 60
+
+
+def format_restoration_time(restoration_time: str) -> str:
+    match = re.search(r'(\d{1,2}:\d{2})\s+(\d{2}\.\d{2}\.\d{4})', restoration_time)
+    if not match:
+        return restoration_time
+
+    time_str = match.group(1)
+    date_str = match.group(2)
+
+    try:
+        restoration_date = datetime.strptime(date_str, "%d.%m.%Y").date()
+    except ValueError:
+        return restoration_time
+
+    now_kyiv = datetime.now(KYIV_TZ)
+    today_date = now_kyiv.date()
+    tomorrow_date = today_date + timedelta(days=1)
+
+    if restoration_date == today_date:
+        return time_str
+    elif restoration_date == tomorrow_date:
+        return f"tomorrow {time_str}"
+    else:
+        return f"{time_str} {date_str}"
+
+
+@dataclass
+class DtekCurrentOutage:
+    status: DtekOutageStatus
+    reason: str = ""
+    start_time: str = ""
+    restoration_time: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> Optional['DtekCurrentOutage']:
+        if not data:
+            return None
+        return cls(
+            status=DtekOutageStatus(data.get('status', 'power_on')),
+            reason=data.get('reason', ''),
+            start_time=data.get('start_time', ''),
+            restoration_time=data.get('restoration_time', '')
+        )
+
+    @property
+    def is_emergency(self) -> bool:
+        return self.status == DtekOutageStatus.EMERGENCY
+
+    @property
+    def is_outage(self) -> bool:
+        return self.status != DtekOutageStatus.POWER_ON
+
+
+@dataclass
+class DtekHourSlot:
+    hour: int
+    status: DtekCellStatus
+
+    @property
+    def has_outage(self) -> bool:
+        return self.status != DtekCellStatus.POWER_ON
+
+    @property
+    def outage_minutes(self) -> tuple[int, int]:
+        if self.status == DtekCellStatus.POWER_OFF:
+            return (0, 60)
+        elif self.status == DtekCellStatus.POWER_OFF_FIRST_30:
+            return (0, 30)
+        elif self.status == DtekCellStatus.POWER_OFF_SECOND_30:
+            return (30, 60)
+        return (0, 0)
+
+
+@dataclass
+class DtekDaySchedule:
+    date: str
+    slots: tuple[DtekHourSlot, ...]
+    last_updated: str
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> Optional['DtekDaySchedule']:
+        if not data or 'slots' not in data:
+            return None
+        return cls(
+            date=data.get('date', ''),
+            slots=tuple(
+                DtekHourSlot(hour=s['hour'], status=DtekCellStatus(s['status']))
+                for s in data['slots']
+            ),
+            last_updated=data.get('last_updated', '')
+        )
+
+    def get_outage_periods(self) -> list[tuple[int, int]]:
+        if not self.slots:
+            return []
+
+        periods = []
+        current_start = None
+        current_end = None
+
+        for slot in self.slots:
+            if slot.has_outage:
+                start_offset, end_offset = slot.outage_minutes
+                slot_start = slot.hour * 60 + start_offset
+                slot_end = slot.hour * 60 + end_offset
+
+                if current_start is None:
+                    current_start = slot_start
+                    current_end = slot_end
+                elif slot_start == current_end:
+                    current_end = slot_end
+                else:
+                    periods.append((current_start, current_end))
+                    current_start = slot_start
+                    current_end = slot_end
+            else:
+                if current_start is not None:
+                    periods.append((current_start, current_end))
+                    current_start = None
+                    current_end = None
+
+        if current_start is not None:
+            periods.append((current_start, current_end))
+
+        return periods
+
+    def is_outage_at_minute(self, minute: int) -> bool:
+        for slot in self.slots:
+            if not slot.has_outage:
+                continue
+            start_offset, end_offset = slot.outage_minutes
+            slot_start = slot.hour * 60 + start_offset
+            slot_end = slot.hour * 60 + end_offset
+            if slot_start <= minute < slot_end:
+                return True
+        return False
+
+    def get_current_outage_end(self, minute: int) -> Optional[int]:
+        periods = self.get_outage_periods()
+        for start, end in periods:
+            if start <= minute < end:
+                return end
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,154 +234,6 @@ class PowerState:
 
     def is_power_on(self) -> bool:
         return self.status == PowerStatus.OK
-
-
-@dataclass(frozen=True, slots=True)
-class TimeSlot:
-    start: int
-    end: int
-    type: str
-
-    def is_power_off(self) -> bool:
-        return self.type == SlotType.DEFINITE.value
-
-    def contains_minute(self, minute: int) -> bool:
-        return self.start <= minute < self.end
-
-
-@dataclass(frozen=True, slots=True)
-class DaySchedule:
-    date: str
-    slots: tuple[TimeSlot, ...]
-    status: str
-
-    def get_slot_at_minute(self, minute: int) -> Optional[TimeSlot]:
-        for slot in self.slots:
-            if slot.contains_minute(minute):
-                return slot
-        return None
-
-    def get_next_transition(self, current_minute: int) -> Optional[tuple[int, bool]]:
-        for i, slot in enumerate(self.slots):
-            if slot.end > current_minute:
-                if slot.start > current_minute:
-                    return (slot.start, slot.is_power_off())
-                if slot.end < MINUTES_IN_DAY and i + 1 < len(self.slots):
-                    next_slot = self.slots[i + 1]
-                    return (slot.end, next_slot.is_power_off())
-        return None
-
-    @classmethod
-    def from_dict(cls, data: dict) -> Optional['DaySchedule']:
-        if not data or 'slots' not in data:
-            return None
-        try:
-            return cls(
-                date=data.get('date', ''),
-                slots=tuple(TimeSlot(**slot) for slot in data['slots']),
-                status=data.get('status', '')
-            )
-        except (TypeError, KeyError) as e:
-            logger.warning(f"⚠️ Failed to parse schedule: {e}")
-            return None
-
-
-@dataclass(frozen=True, slots=True)
-class YasnoSchedule:
-    today: DaySchedule
-    tomorrow: Optional[DaySchedule]
-    updated_on: datetime
-    group: str
-
-
-class YasnoAPIClient:
-    BASE_URL = "https://app.yasno.ua/api/blackout-service/public/shutdowns"
-    MAX_RETRIES = 3
-    RETRY_DELAY = 2
-    REQUEST_TIMEOUT = 10
-
-    def __init__(self, region: str, dso: str, group: str):
-        self.region = region
-        self.dso = dso
-        self.group = group
-        self.session: Optional[aiohttp.ClientSession] = None
-
-    async def connect(self) -> None:
-        if self.session and not self.session.closed:
-            return
-        if self.session:
-            await self.close()
-
-        timeout = aiohttp.ClientTimeout(total=self.REQUEST_TIMEOUT)
-        connector = aiohttp.TCPConnector(limit=10, limit_per_host=5, ttl_dns_cache=300)
-        self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-
-    async def fetch_schedule(self) -> Optional[YasnoSchedule]:
-        await self.connect()
-
-        url = f"{self.BASE_URL}/regions/{self.region}/dsos/{self.dso}/planned-outages"
-
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                async with self.session.get(url) as response:
-                    if response.status != 200:
-                        logger.error(f"❌ Yasno API error: {response.status}")
-                        if attempt < self.MAX_RETRIES - 1:
-                            await asyncio.sleep(self.RETRY_DELAY * (2 ** attempt))
-                            continue
-                        return None
-
-                    data = await response.json()
-
-                    if self.group not in data:
-                        logger.error(f"❌ Group {self.group} not found in response")
-                        return None
-
-                    group_data = data[self.group]
-                    updated_on_str = group_data.get('updatedOn')
-
-                    if not updated_on_str:
-                        logger.error("❌ Missing updatedOn in response")
-                        return None
-
-                    today = DaySchedule.from_dict(group_data.get('today', {}))
-                    if not today:
-                        logger.error("❌ Failed to parse today schedule")
-                        return None
-
-                    tomorrow = DaySchedule.from_dict(group_data.get('tomorrow', {}))
-
-                    try:
-                        updated_on = datetime.fromisoformat(updated_on_str.replace('Z', '+00:00'))
-                    except (ValueError, AttributeError) as e:
-                        logger.error(f"❌ Failed to parse updated_on timestamp: {e}")
-                        return None
-
-                    return YasnoSchedule(
-                        today=today,
-                        tomorrow=tomorrow,
-                        updated_on=updated_on,
-                        group=self.group
-                    )
-
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.warning(f"⚠️ Yasno API attempt {attempt + 1}/{self.MAX_RETRIES} failed: {e}")
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.RETRY_DELAY * (2 ** attempt))
-                else:
-                    logger.error(f"❌ Failed to fetch Yasno schedule after {self.MAX_RETRIES} attempts")
-                    return None
-            except Exception as e:
-                logger.error(f"❌ Unexpected error fetching Yasno schedule: {e}")
-                return None
-
-        return None
-
-    async def close(self) -> None:
-        if self.session and not self.session.closed:
-            await self.session.close()
-            await asyncio.sleep(0.25)
-            logger.info("✅ Yasno API client closed")
 
 
 class HomeAssistantClient:
@@ -426,63 +422,40 @@ class Database:
             logger.error(f"❌ Failed to save event: {e}")
             raise
 
-    async def get_yasno_schedule(self) -> Optional[dict]:
+    async def get_dtek_schedule(self) -> Optional[dict]:
         if not self.pool:
             raise RuntimeError("Database pool not initialized")
 
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT updated_on, schedule_data "
-                    "FROM yasno_schedule WHERE id = 1"
+                    "SELECT current_outage, today_schedule, tomorrow_schedule, updated_at "
+                    "FROM dtek_schedule WHERE id = 1"
                 )
                 if row:
-                    schedule_data = row['schedule_data']
-                    if isinstance(schedule_data, str):
-                        try:
-                            schedule_data = json.loads(schedule_data)
-                        except json.JSONDecodeError as e:
-                            logger.error(f"❌ Failed to parse schedule JSON: {e}")
-                            return None
                     return {
-                        'updated_on': row['updated_on'],
-                        'schedule_data': schedule_data
+                        'current_outage': self._parse_json(row['current_outage']),
+                        'today': self._parse_json(row['today_schedule']),
+                        'tomorrow': self._parse_json(row['tomorrow_schedule']),
+                        'updated_at': row['updated_at']
                     }
                 return None
         except Exception as e:
-            logger.error(f"❌ Failed to get yasno schedule: {e}")
+            logger.error(f"❌ Failed to get dtek schedule: {e}")
             raise
 
-    async def save_yasno_schedule(
-        self,
-        updated_on: datetime,
-        schedule_data: dict
-    ) -> None:
-        if not self.pool:
-            raise RuntimeError("Database pool not initialized")
-
-        try:
-            schedule_json = json.dumps(schedule_data)
-        except (TypeError, ValueError) as e:
-            logger.error(f"❌ Failed to serialize schedule data: {e}")
-            raise
-
-        try:
-            async with self.pool.acquire() as conn:
-                result = await conn.execute(
-                    """
-                    UPDATE yasno_schedule
-                    SET updated_on = $1,
-                        schedule_data = $2
-                    WHERE id = 1
-                    """,
-                    updated_on, schedule_json
-                )
-                if result == "UPDATE 0":
-                    logger.warning("⚠️ No rows updated in yasno_schedule table")
-        except Exception as e:
-            logger.error(f"❌ Failed to save yasno schedule: {e}")
-            raise
+    def _parse_json(self, value) -> Optional[dict]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if not value:
+                return None
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Failed to parse JSON: {e}")
+                return None
+        return value
 
     async def close(self) -> None:
         if self.pool:
@@ -643,27 +616,24 @@ class NotificationService:
             logger.warning(f"⚠️ Error stopping notification service: {e}")
 
 
-class YasnoScheduleMonitor:
+class DtekScheduleMonitor:
     CHECK_INTERVAL = 60
     INITIAL_DELAY = 5
 
-    def __init__(
-        self,
-        yasno_client: YasnoAPIClient,
-        db: Database,
-        notifier: NotificationService,
-        power_monitor: 'PowerMonitor'
-    ):
-        self.yasno = yasno_client
+    def __init__(self, db: Database, notifier: NotificationService, power_monitor: 'PowerMonitor'):
         self.db = db
         self.notifier = notifier
         self.power_monitor = power_monitor
         self._shutdown = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self._saved_current: Optional[DtekCurrentOutage] = None
+        self._saved_today: Optional[DtekDaySchedule] = None
+        self._saved_tomorrow: Optional[DtekDaySchedule] = None
 
     async def start(self) -> None:
+        await self._load_initial_state()
         self._task = asyncio.create_task(self._monitor_loop())
-        logger.info("📅 Yasno schedule monitor started")
+        logger.info("📅 DTEK schedule monitor started")
 
     async def stop(self) -> None:
         self._shutdown.set()
@@ -676,7 +646,17 @@ class YasnoScheduleMonitor:
                     await self._task
                 except asyncio.CancelledError:
                     pass
-        logger.info("✅ Yasno schedule monitor stopped")
+        logger.info("✅ DTEK schedule monitor stopped")
+
+    async def _load_initial_state(self) -> None:
+        data = await self.db.get_dtek_schedule()
+        if data:
+            self._saved_current = DtekCurrentOutage.from_dict(data.get('current_outage'))
+            self._saved_today = DtekDaySchedule.from_dict(data.get('today'))
+            self._saved_tomorrow = DtekDaySchedule.from_dict(data.get('tomorrow'))
+            logger.info("📊 Initial DTEK schedule loaded from DB")
+        else:
+            logger.info("📊 No DTEK schedule in DB yet")
 
     async def _monitor_loop(self) -> None:
         try:
@@ -689,7 +669,7 @@ class YasnoScheduleMonitor:
             try:
                 await self._check_schedule()
             except Exception as e:
-                logger.error(f"❌ Error checking Yasno schedule: {e}")
+                logger.error(f"❌ Error checking DTEK schedule: {e}")
 
             try:
                 await asyncio.wait_for(self._shutdown.wait(), timeout=self.CHECK_INTERVAL)
@@ -697,215 +677,198 @@ class YasnoScheduleMonitor:
                 pass
 
     async def _check_schedule(self) -> None:
-        schedule = await self.yasno.fetch_schedule()
-        if not schedule:
+        data = await self.db.get_dtek_schedule()
+        if not data:
             return
 
-        try:
-            now_kyiv = datetime.now(KYIV_TZ)
-            current_minute = now_kyiv.hour * 60 + now_kyiv.minute
+        current_outage = DtekCurrentOutage.from_dict(data.get('current_outage'))
+        today = DtekDaySchedule.from_dict(data.get('today'))
+        tomorrow = DtekDaySchedule.from_dict(data.get('tomorrow'))
 
-            saved_schedule = await self.db.get_yasno_schedule()
+        if not today:
+            return
 
-            if saved_schedule:
-                saved_updated_on = saved_schedule['updated_on']
+        if self._saved_today is None:
+            self._saved_current = current_outage
+            self._saved_today = today
+            self._saved_tomorrow = tomorrow
+            logger.info("📅 Initial DTEK schedule state set")
+            return
 
-                if schedule.updated_on > saved_updated_on:
-                    await self._handle_schedule_update(
-                        schedule,
-                        saved_schedule,
-                        now_kyiv,
-                        current_minute
-                    )
-        except Exception as e:
-            logger.error(f"❌ Error processing schedule: {e}")
-            raise
+        now_kyiv = datetime.now(KYIV_TZ)
+        current_minute = now_kyiv.hour * 60 + now_kyiv.minute
 
-        await self._save_schedule(schedule)
+        outage_changed = await self._check_outage_changes(current_outage, self._saved_current, today)
 
-    async def _handle_schedule_update(
+        is_new_day = self._saved_today and today and self._saved_today.date != today.date
+
+        saved_tomorrow_had_outages = self._has_outages(self._saved_tomorrow) if not is_new_day else False
+        tomorrow_has_outages = self._has_outages(tomorrow)
+
+        tomorrow_published = tomorrow_has_outages and not saved_tomorrow_had_outages
+        tomorrow_changed = tomorrow_has_outages and saved_tomorrow_had_outages and self._slots_differ(tomorrow, self._saved_tomorrow)
+        tomorrow_cancelled = saved_tomorrow_had_outages and not tomorrow_has_outages
+
+        if tomorrow_published:
+            await self._handle_tomorrow_update(tomorrow, now_kyiv, current_minute, is_new=True)
+            await self._check_today_changes(today, now_kyiv, current_minute, tomorrow_has_outages=True)
+        elif tomorrow_cancelled:
+            is_new_day = self._saved_today and today and self._saved_today.date != today.date
+            if is_new_day and self._saved_tomorrow and not self._slots_differ(today, self._saved_tomorrow):
+                logger.debug("📅 Day shifted, tomorrow became today (no cancellation)")
+            else:
+                await self._handle_tomorrow_cancelled(now_kyiv)
+            await self._update_pinned_schedule(today, now_kyiv, use_tomorrow=False)
+            await self._check_today_changes(today, now_kyiv, current_minute, tomorrow_has_outages=False)
+        elif tomorrow_changed:
+            await self._update_pinned_schedule(tomorrow, now_kyiv, use_tomorrow=True)
+            await self._send_schedule_change_notification(tomorrow, now_kyiv, is_tomorrow=True)
+            await self._check_today_changes(today, now_kyiv, current_minute, tomorrow_has_outages=True)
+        elif tomorrow_has_outages:
+            await self._update_pinned_schedule(tomorrow, now_kyiv, use_tomorrow=True)
+            await self._check_today_changes(today, now_kyiv, current_minute, tomorrow_has_outages=True)
+        else:
+            await self._update_pinned_schedule(today, now_kyiv, use_tomorrow=False)
+            await self._check_today_changes(today, now_kyiv, current_minute, tomorrow_has_outages=False)
+
+        self._saved_current = current_outage
+        self._saved_today = today
+        self._saved_tomorrow = tomorrow
+
+    async def _check_outage_changes(
         self,
-        schedule: YasnoSchedule,
-        saved_schedule: dict,
-        now_kyiv: datetime,
-        current_minute: int
-    ) -> None:
-        try:
-            logger.info(f"📅 Schedule updated: {saved_schedule['updated_on']} -> {schedule.updated_on}")
+        current: Optional[DtekCurrentOutage],
+        saved: Optional[DtekCurrentOutage],
+        today_schedule: Optional[DtekDaySchedule]
+    ) -> bool:
+        was_emergency = saved.is_emergency if saved else False
+        is_emergency = current.is_emergency if current else False
 
-            schedule_data = saved_schedule.get('schedule_data')
-            saved_today_status = schedule_data.get('today', {}).get('status', '') if schedule_data else ''
-
-            if schedule.today.status == ScheduleStatus.EMERGENCY_SHUTDOWNS.value:
-                if saved_today_status != ScheduleStatus.EMERGENCY_SHUTDOWNS.value:
-                    message = (
-                        f"🚨 **Emergency shutdowns**\n\n"
-                        f"Scheduled outages are cancelled"
-                    )
-                    await self.notifier.send(message)
-                    logger.info("🚨 Sent emergency shutdowns notification")
-                else:
-                    logger.info("🚨 Emergency shutdowns still in effect, skipping notification")
-                return
-
-            if (saved_today_status == ScheduleStatus.EMERGENCY_SHUTDOWNS.value and
-                schedule.today.status != ScheduleStatus.EMERGENCY_SHUTDOWNS.value):
+        if is_emergency and was_emergency:
+            power_is_off = self.power_monitor.is_power_off()
+            if power_is_off and current.restoration_time != saved.restoration_time:
+                formatted_time = format_restoration_time(current.restoration_time)
                 message = (
-                    f"✅ **Emergency shutdowns ended**\n\n"
-                    f"Scheduled outages are active now"
+                    f"🔄 **Restoration time updated**\n\n"
+                    f"New expected time: **{formatted_time}**"
                 )
                 await self.notifier.send(message)
-                logger.info("✅ Sent emergency shutdowns ended notification")
+                logger.info(f"🔄 Restoration time changed: {formatted_time}")
+                return True
 
-            tomorrow_published = (
-                schedule.tomorrow and
-                schedule.tomorrow.status == ScheduleStatus.SCHEDULE_APPLIES.value and
-                schedule_data and
-                schedule_data.get('tomorrow', {}).get('status') != ScheduleStatus.SCHEDULE_APPLIES.value
-            )
+        return False
 
-            tomorrow_is_active = (
-                schedule.tomorrow and
-                schedule.tomorrow.status == ScheduleStatus.SCHEDULE_APPLIES.value
-            )
+    async def _handle_tomorrow_cancelled(self, now_kyiv: datetime) -> None:
+        date_str = (now_kyiv + timedelta(days=1)).strftime("%d.%m")
+        message = (
+            f"📅 **Tomorrow ({date_str})**\n\n"
+            f"✅ Outages cancelled"
+        )
+        await self.notifier.send(message)
+        logger.info("📅 Tomorrow outages cancelled")
 
-            if tomorrow_published:
-                await self._handle_tomorrow_update(schedule, saved_schedule, now_kyiv, current_minute)
-                await self._check_today_changes(schedule, saved_schedule, now_kyiv, current_minute)
-            elif tomorrow_is_active:
-                await self._update_pinned_schedule(schedule, saved_schedule, now_kyiv, current_minute, use_tomorrow=True)
-                await self._check_today_changes(schedule, saved_schedule, now_kyiv, current_minute)
-            else:
-                await self._update_pinned_schedule(schedule, saved_schedule, now_kyiv, current_minute, use_tomorrow=False)
-        except Exception as e:
-            logger.error(f"❌ Error handling schedule update: {e}")
+    def _has_outages(self, schedule: Optional[DtekDaySchedule]) -> bool:
+        if not schedule:
+            return False
+        return bool(schedule.get_outage_periods())
+
+    def _slots_differ(self, new: Optional[DtekDaySchedule], old: Optional[DtekDaySchedule]) -> bool:
+        if new is None and old is None:
+            return False
+        if new is None or old is None:
+            return True
+
+        if len(new.slots) != len(old.slots):
+            return True
+
+        for new_slot, old_slot in zip(new.slots, old.slots):
+            if new_slot.hour != old_slot.hour or new_slot.status != old_slot.status:
+                return True
+
+        return False
 
     async def _update_pinned_schedule(
         self,
-        schedule: YasnoSchedule,
-        saved_schedule: dict,
+        schedule: DtekDaySchedule,
         now_kyiv: datetime,
-        current_minute: int,
         use_tomorrow: bool = False
     ) -> None:
-        try:
-            day_schedule = schedule.tomorrow if use_tomorrow else schedule.today
-            day_label = "tomorrow" if use_tomorrow else "today"
+        saved_schedule = self._saved_tomorrow if use_tomorrow else self._saved_today
 
-            if not day_schedule or not day_schedule.slots:
-                logger.info(f"📅 {day_label.capitalize()} schedule update but no slots available")
-                return
+        if not self._slots_differ(schedule, saved_schedule):
+            return
 
-            if not use_tomorrow and schedule.today.status == ScheduleStatus.EMERGENCY_SHUTDOWNS.value:
-                logger.info("📅 Today schedule updated but emergency shutdowns in effect - not updating pinned message")
-                return
+        day_label = "tomorrow" if use_tomorrow else "today"
+        date_str = (now_kyiv + timedelta(days=1)).strftime("%d.%m") if use_tomorrow else now_kyiv.strftime("%d.%m")
 
-            schedule_data = saved_schedule.get('schedule_data') if saved_schedule else None
-            saved_day_key = 'tomorrow' if use_tomorrow else 'today'
-            saved_day_data = schedule_data.get(saved_day_key, {}) if schedule_data else {}
-            saved_slots = saved_day_data.get('slots', [])
+        outage_periods = schedule.get_outage_periods()
 
-            current_slots = [
-                {'start': s.start, 'end': s.end, 'type': s.type}
-                for s in day_schedule.slots
-            ]
-
-            slots_changed = saved_slots != current_slots
-
-            if not slots_changed:
-                logger.debug(f"📅 {day_label.capitalize()} slots unchanged, skipping pinned message update")
-                return
-
-            outage_slots = [slot for slot in day_schedule.slots if slot.is_power_off()]
-
-            date_str = (now_kyiv + timedelta(days=1)).strftime("%d.%m") if use_tomorrow else now_kyiv.strftime("%d.%m")
-
-            if not outage_slots:
-                schedule_message = (
-                    f"📅 **{date_str} schedule**\n\n"
-                    f"✅ No outages scheduled"
-                )
-            else:
-                schedule_message = self._format_schedule_message(date_str, outage_slots)
-
-            await self.notifier.edit_pinned_message(schedule_message)
-            logger.info(f"📅 Updated pinned with {day_label} schedule ({date_str})")
-
-            current_next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
-            saved_next_outage = self._get_saved_next_outage_slot(saved_schedule, now_kyiv, current_minute)
-
-            next_slot_changed = self._outage_slots_differ(current_next_outage, saved_next_outage)
-
-            saved_outage_minutes = self._calc_outage_minutes(saved_slots)
-            current_outage_minutes = sum(s.end - s.start for s in outage_slots)
-
-            await self._send_schedule_change_notification(
-                schedule, now_kyiv, current_minute,
-                is_tomorrow=use_tomorrow,
-                next_slot_changed=next_slot_changed,
-                old_outage_minutes=saved_outage_minutes,
-                new_outage_minutes=current_outage_minutes
+        if not outage_periods:
+            schedule_message = (
+                f"📅 **{date_str} schedule**\n\n"
+                f"✅ No outages scheduled"
             )
-        except Exception as e:
-            logger.error(f"❌ Error updating pinned schedule: {e}")
+        else:
+            schedule_message = self._format_schedule_message(date_str, outage_periods)
+
+        await self.notifier.edit_pinned_message(schedule_message)
+        logger.info(f"📅 Updated pinned with {day_label} schedule ({date_str})")
 
     async def _check_today_changes(
         self,
-        schedule: YasnoSchedule,
-        saved_schedule: dict,
+        today: DtekDaySchedule,
         now_kyiv: datetime,
-        current_minute: int
+        current_minute: int,
+        tomorrow_has_outages: bool = False
     ) -> None:
-        try:
-            schedule_data = saved_schedule.get('schedule_data') if saved_schedule else None
-            saved_today_data = schedule_data.get('today', {}) if schedule_data else {}
-            saved_today_slots = saved_today_data.get('slots', [])
+        if not self._slots_differ(today, self._saved_today):
+            return
 
-            current_today_slots = [
-                {'start': s.start, 'end': s.end, 'type': s.type}
-                for s in schedule.today.slots
-            ]
+        is_new_day = self._saved_today and today and self._saved_today.date != today.date
+        if is_new_day and self._saved_tomorrow and not self._slots_differ(today, self._saved_tomorrow):
+            logger.debug("📅 Day shifted, but schedule unchanged (tomorrow became today)")
+            return
 
-            if saved_today_slots == current_today_slots:
-                return
-
+        if tomorrow_has_outages:
             logger.info("📅 Today schedule changed while tomorrow is active")
+        else:
+            logger.info("📅 Today schedule changed")
 
-            current_next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
-            saved_next_outage = self._get_saved_next_outage_slot(saved_schedule, now_kyiv, current_minute)
+        current_next_outage = self._find_next_outage_period(today, current_minute)
+        saved_next_outage = self._find_next_outage_period(self._saved_today, current_minute) if self._saved_today else None
 
-            if not self._outage_slots_differ(current_next_outage, saved_next_outage):
-                logger.debug("📅 Today slots changed but next outage unchanged, skipping notification")
-                return
+        if current_next_outage == saved_next_outage:
+            return
 
-            if not current_next_outage:
-                message = (
-                    f"📅 **Today schedule updated**\n\n"
-                    f"✅ No more outages scheduled"
-                )
-            else:
-                start_time, end_time, is_merged = current_next_outage
-                start_str = start_time.strftime("%H:%M")
-                end_str = end_time.strftime("%H:%M")
-                is_tomorrow_slot = start_time.date() > now_kyiv.date()
-                day_prefix = "tomorrow " if is_tomorrow_slot else ""
+        date_str = today.date
 
-                slot_info = f"Current outage extended: **{start_str} - {day_prefix}{end_str}**" if is_merged else f"Next outage: **{day_prefix}{start_str} - {end_str}**"
-                message = f"📅 **Today schedule updated**\n\n{slot_info}"
+        if not current_next_outage:
+            message = (
+                f"📅 **Today ({date_str}) schedule updated**\n\n"
+                f"✅ No more outages scheduled"
+            )
+        else:
+            start, end = current_next_outage
+            start_str = f"{start // 60:02d}:{start % 60:02d}"
+            end_h, end_m = (0, 0) if end == MINUTES_IN_DAY else (end // 60, end % 60)
+            end_str = f"{end_h:02d}:{end_m:02d}"
 
+            message = f"📅 **Today ({date_str}) schedule updated**\n\nNext outage: **{start_str} - {end_str}**"
+
+        if tomorrow_has_outages:
             await self.notifier.send(message)
-            logger.info("📅 Sent today schedule change notification")
-        except Exception as e:
-            logger.error(f"❌ Error checking today changes: {e}")
+        else:
+            await self.notifier.send_reply_to_pinned(message)
+        logger.info("📅 Sent today schedule change notification")
 
-    def _format_schedule_message(self, date_str: str, outage_slots: list[TimeSlot]) -> str:
-        total_outage_minutes = sum(slot.end - slot.start for slot in outage_slots)
+    def _format_schedule_message(self, date_str: str, outage_periods: list[tuple[int, int]]) -> str:
+        total_outage_minutes = sum(end - start for start, end in outage_periods)
         total_power_minutes = MINUTES_IN_DAY - total_outage_minutes
 
         outage_lines = []
-        for slot in outage_slots:
-            start_time = f"{slot.start // 60:02d}:{slot.start % 60:02d}"
-            end_h, end_m = (0, 0) if slot.end == MINUTES_IN_DAY else (slot.end // 60, slot.end % 60)
+        for start, end in outage_periods:
+            start_time = f"{start // 60:02d}:{start % 60:02d}"
+            end_h, end_m = (0, 0) if end == MINUTES_IN_DAY else (end // 60, end % 60)
             end_time = f"{end_h:02d}:{end_m:02d}"
             outage_lines.append(f"{start_time} - {end_time}")
 
@@ -919,13 +882,6 @@ class YasnoScheduleMonitor:
             + f"🔴 Outages: **{outage_duration}**"
         )
 
-    def _calc_outage_minutes(self, slots: list) -> int:
-        total = 0
-        for slot in slots:
-            if slot.get('type') == SlotType.DEFINITE.value:
-                total += slot.get('end', 0) - slot.get('start', 0)
-        return total
-
     def _format_duration_hours(self, minutes: int) -> str:
         hours = minutes // 60
         mins = minutes % 60
@@ -933,344 +889,92 @@ class YasnoScheduleMonitor:
 
     async def _send_schedule_change_notification(
         self,
-        schedule: YasnoSchedule,
+        schedule: DtekDaySchedule,
         now_kyiv: datetime,
-        current_minute: int,
-        is_tomorrow: bool = False,
-        next_slot_changed: bool = True,
-        old_outage_minutes: int = 0,
-        new_outage_minutes: int = 0
+        is_tomorrow: bool = False
     ) -> None:
-        try:
-            day_label = "Tomorrow" if is_tomorrow else "Today"
+        day_label = "Tomorrow" if is_tomorrow else "Today"
+        current_minute = now_kyiv.hour * 60 + now_kyiv.minute
 
-            if next_slot_changed:
-                next_outage = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
+        next_outage = self._find_next_outage_period(schedule, current_minute if not is_tomorrow else 0)
 
-                if not next_outage:
-                    message = (
-                        f"📅 **{day_label} schedule updated**\n\n"
-                        f"✅ No more outages scheduled"
-                    )
-                    await self.notifier.send_reply_to_pinned(message)
-                    logger.info(f"📅 Sent {day_label.lower()} schedule change notification: no more outages")
-                    return
+        if not next_outage:
+            message = (
+                f"📅 **{day_label} schedule updated**\n\n"
+                f"✅ No more outages scheduled"
+            )
+            await self.notifier.send_reply_to_pinned(message)
+            logger.info(f"📅 Sent {day_label.lower()} schedule change notification: no more outages")
+            return
 
-                start_time, end_time, _ = next_outage
-                start_str = start_time.strftime("%H:%M")
-                end_str = end_time.strftime("%H:%M")
+        start, end = next_outage
+        start_str = f"{start // 60:02d}:{start % 60:02d}"
+        end_h, end_m = (0, 0) if end == MINUTES_IN_DAY else (end // 60, end % 60)
+        end_str = f"{end_h:02d}:{end_m:02d}"
 
-                is_tomorrow_slot = start_time.date() > now_kyiv.date()
-                day_prefix = "tomorrow " if is_tomorrow_slot else ""
+        day_prefix = "tomorrow " if is_tomorrow else ""
 
-                message = (
-                    f"📅 **{day_label} schedule updated**\n\n"
-                    f"Next outage: **{day_prefix}{start_str} - {end_str}**"
-                )
+        message = (
+            f"📅 **{day_label} schedule updated**\n\n"
+            f"Next outage: **{day_prefix}{start_str} - {end_str}**"
+        )
 
-                await self.notifier.send_reply_to_pinned(message)
-                logger.info(f"📅 Sent {day_label.lower()} schedule change notification: {day_prefix}{start_str} - {end_str}")
-            else:
-                old_duration = self._format_duration_hours(old_outage_minutes)
-                new_duration = self._format_duration_hours(new_outage_minutes)
-
-                message = (
-                    f"📅 **{day_label} schedule updated**\n\n"
-                    f"Next outage slot unchanged\n"
-                    f"Outage duration: **{old_duration}** → **{new_duration}**"
-                )
-
-                await self.notifier.send_reply_to_pinned(message)
-                logger.info(f"📅 Sent {day_label.lower()} schedule change notification: {old_duration} -> {new_duration}")
-        except Exception as e:
-            logger.error(f"❌ Error sending schedule change notification: {e}")
+        await self.notifier.send_reply_to_pinned(message)
+        logger.info(f"📅 Sent {day_label.lower()} schedule change notification: {day_prefix}{start_str} - {end_str}")
 
     async def _handle_tomorrow_update(
         self,
-        schedule: YasnoSchedule,
-        saved_schedule: dict,
+        tomorrow: DtekDaySchedule,
         now_kyiv: datetime,
-        current_minute: int
+        current_minute: int,
+        is_new: bool = False
     ) -> None:
-        if not schedule.tomorrow or not schedule.tomorrow.slots:
-            logger.warning("⚠️ Tomorrow schedule update called but no tomorrow data available")
-            return
+        outage_periods = tomorrow.get_outage_periods()
 
-        outage_slots = [slot for slot in schedule.tomorrow.slots if slot.is_power_off()]
-
-        if not outage_slots:
+        if not outage_periods:
             logger.info("📅 Tomorrow has no outage slots")
             return
 
         tomorrow_date = now_kyiv + timedelta(days=1)
         date_str = tomorrow_date.strftime("%d.%m")
 
-        schedule_message = self._format_schedule_message(date_str, outage_slots)
+        schedule_message = self._format_schedule_message(date_str, outage_periods)
 
         await self.notifier.send(schedule_message, pin=True, unpin_all_first=True)
-        total_minutes = sum(s.end - s.start for s in outage_slots)
-        logger.info(f"📅 Sent tomorrow schedule update with {len(outage_slots)} outage slots ({self._format_duration_hours(total_minutes)} total)")
+        total_minutes = sum(end - start for start, end in outage_periods)
+        logger.info(f"📅 Sent tomorrow schedule update with {len(outage_periods)} outage periods ({self._format_duration_hours(total_minutes)} total)")
 
-        await self._send_tomorrow_schedule_notification(schedule, saved_schedule, now_kyiv, current_minute)
-
-    async def _send_tomorrow_schedule_notification(
-        self,
-        schedule: YasnoSchedule,
-        saved_schedule: dict,
-        now_kyiv: datetime,
-        current_minute: int
-    ) -> None:
-        try:
-            next_outage_slot = self._find_next_outage_slot(schedule, now_kyiv, current_minute)
-
-            schedule_data = saved_schedule.get('schedule_data') if saved_schedule else None
-            saved_next_outage_slot = None
-
-            if schedule_data:
-                saved_schedule_obj = self._reconstruct_schedule(schedule_data, saved_schedule.get('updated_on'))
-                if saved_schedule_obj:
-                    saved_next_outage_slot = self._find_next_outage_slot(saved_schedule_obj, now_kyiv, current_minute)
-
-            if next_outage_slot == saved_next_outage_slot:
-                logger.info("📅 Next outage slot unchanged, skipping notification")
-                return
-
-            if not next_outage_slot:
-                message = (
-                    f"📅 **Tomorrow schedule updated**\n\n"
-                    f"✅ No more outages scheduled"
-                )
-                await self.notifier.send_reply_to_pinned(message)
-                logger.info("📅 Sent tomorrow schedule notification: no outages")
-                return
-
-            start_time, end_time, _ = next_outage_slot
-            start_str = start_time.strftime("%H:%M")
-            end_str = end_time.strftime("%H:%M")
-
-            is_tomorrow = start_time.date() > now_kyiv.date()
-            day_prefix = "tomorrow " if is_tomorrow else ""
+        next_outage = self._find_next_outage_period(tomorrow, 0)
+        if next_outage:
+            start, end = next_outage
+            start_str = f"{start // 60:02d}:{start % 60:02d}"
+            end_h, end_m = (0, 0) if end == MINUTES_IN_DAY else (end // 60, end % 60)
+            end_str = f"{end_h:02d}:{end_m:02d}"
 
             message = (
-                f"📅 **Tomorrow schedule updated**\n\n"
-                f"Next outage: **{day_prefix}{start_str} - {end_str}**"
+                f"📅 **Tomorrow schedule published**\n\n"
+                f"Next outage: **tomorrow {start_str} - {end_str}**"
             )
 
             await self.notifier.send_reply_to_pinned(message)
-            logger.info(f"📅 Sent tomorrow schedule notification: {day_prefix}{start_str} - {end_str}")
-        except Exception as e:
-            logger.error(f"❌ Error sending tomorrow schedule notification: {e}")
+            logger.info(f"📅 Sent tomorrow schedule notification: tomorrow {start_str} - {end_str}")
 
-    def _reconstruct_schedule(self, schedule_data: dict, updated_on: Optional[datetime] = None) -> Optional[YasnoSchedule]:
-        today = DaySchedule.from_dict(schedule_data.get('today', {}))
-        if not today:
-            return None
-
-        tomorrow = DaySchedule.from_dict(schedule_data.get('tomorrow', {}))
-
-        return YasnoSchedule(
-            today=today,
-            tomorrow=tomorrow,
-            updated_on=updated_on or datetime.now(timezone.utc),
-            group=YASNO_GROUP
-        )
-
-    def _find_next_outage_slot(
+    def _find_next_outage_period(
         self,
-        schedule: YasnoSchedule,
-        now_kyiv: datetime,
-        current_minute: int,
-        skip_current: bool = False
-    ) -> Optional[tuple[datetime, datetime, bool]]:
-        today_outage = self._find_relevant_outage(schedule.today.slots, current_minute, skip_current)
-        
-        tomorrow_outage = None
-        if schedule.tomorrow and schedule.tomorrow.status == ScheduleStatus.SCHEDULE_APPLIES.value:
-            tomorrow_outage = next((s for s in schedule.tomorrow.slots if s.is_power_off()), None)
-
-        if today_outage and tomorrow_outage:
-            if today_outage.end == MINUTES_IN_DAY and tomorrow_outage.start == 0:
-                return self._build_cross_midnight_slot(today_outage, tomorrow_outage, now_kyiv)
-
-        if today_outage:
-            return self._build_slot_times(today_outage, now_kyiv, is_tomorrow=False)
-
-        if tomorrow_outage:
-            return self._build_slot_times(tomorrow_outage, now_kyiv, is_tomorrow=True)
-
-        return None
-
-    def _find_relevant_outage(
-        self,
-        slots: tuple[TimeSlot, ...],
-        current_minute: int,
-        skip_current: bool = False
-    ) -> Optional[TimeSlot]:
-        for slot in slots:
-            if not slot.is_power_off():
-                continue
-            if slot.end <= current_minute:
-                continue
-            if skip_current and slot.start <= current_minute:
-                continue
-            return slot
-        return None
-
-    def _build_slot_times(
-        self,
-        slot: TimeSlot,
-        now_kyiv: datetime,
-        is_tomorrow: bool
-    ) -> tuple[datetime, datetime, bool]:
-        base_date = (now_kyiv + timedelta(days=1)) if is_tomorrow else now_kyiv
-        
-        start_time = base_date.replace(
-            hour=slot.start // 60,
-            minute=slot.start % 60,
-            second=0,
-            microsecond=0
-        )
-        
-        if slot.end == MINUTES_IN_DAY:
-            end_time = (base_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        else:
-            end_time = base_date.replace(
-                hour=slot.end // 60,
-                minute=slot.end % 60,
-                second=0,
-                microsecond=0
-            )
-        
-        return (start_time, end_time, False)
-
-    def _build_cross_midnight_slot(
-        self,
-        today_slot: TimeSlot,
-        tomorrow_slot: TimeSlot,
-        now_kyiv: datetime
-    ) -> tuple[datetime, datetime, bool]:
-        start_time = now_kyiv.replace(
-            hour=today_slot.start // 60,
-            minute=today_slot.start % 60,
-            second=0,
-            microsecond=0
-        )
-        
-        tomorrow_date = now_kyiv + timedelta(days=1)
-        end_time = tomorrow_date.replace(
-            hour=tomorrow_slot.end // 60,
-            minute=tomorrow_slot.end % 60,
-            second=0,
-            microsecond=0
-        )
-        
-        return (start_time, end_time, True)
-
-    def _get_saved_next_outage_slot(
-        self,
-        saved_schedule: dict,
-        now_kyiv: datetime,
+        schedule: Optional[DtekDaySchedule],
         current_minute: int
-    ) -> Optional[tuple[datetime, datetime, bool]]:
-        if not saved_schedule:
+    ) -> Optional[tuple[int, int]]:
+        if not schedule:
             return None
 
-        schedule_data = saved_schedule.get('schedule_data')
-        if not schedule_data:
-            return None
-
-        saved_schedule_obj = self._reconstruct_schedule(
-            schedule_data,
-            saved_schedule.get('updated_on', datetime.now(timezone.utc))
-        )
-        if not saved_schedule_obj:
-            return None
-
-        return self._find_next_outage_slot(saved_schedule_obj, now_kyiv, current_minute)
-
-    def _outage_slots_differ(
-        self,
-        slot1: Optional[tuple[datetime, datetime, bool]],
-        slot2: Optional[tuple[datetime, datetime, bool]]
-    ) -> bool:
-        if slot1 is None and slot2 is None:
-            return False
-        if slot1 is None or slot2 is None:
-            return True
-
-        start1, end1, _ = slot1
-        start2, end2, _ = slot2
-
-        return start1 != start2 or end1 != end2
-
-    async def _save_schedule(self, schedule: YasnoSchedule) -> None:
-        schedule_data = {
-            'today': {
-                'date': schedule.today.date,
-                'status': schedule.today.status,
-                'slots': [{'start': s.start, 'end': s.end, 'type': s.type} for s in schedule.today.slots]
-            }
-        }
-
-        if schedule.tomorrow:
-            schedule_data['tomorrow'] = {
-                'date': schedule.tomorrow.date,
-                'status': schedule.tomorrow.status,
-                'slots': [{'start': s.start, 'end': s.end, 'type': s.type} for s in schedule.tomorrow.slots]
-            }
-
-        await self.db.save_yasno_schedule(
-            schedule.updated_on,
-            schedule_data
-        )
-
-    def _find_next_event(
-        self,
-        schedule: YasnoSchedule,
-        now_kyiv: datetime,
-        current_minute: int
-    ) -> Optional[tuple[datetime, bool]]:
-        next_transition = schedule.today.get_next_transition(current_minute)
-
-        if next_transition:
-            minute, is_outage = next_transition
-            next_time = now_kyiv.replace(
-                hour=minute // 60,
-                minute=minute % 60,
-                second=0,
-                microsecond=0
-            )
-            return (next_time, is_outage)
-
-        current_slot = schedule.today.get_slot_at_minute(current_minute)
-        if not current_slot:
-            return None
-
-        if (schedule.tomorrow and
-            schedule.tomorrow.status == ScheduleStatus.SCHEDULE_APPLIES.value and
-            schedule.tomorrow.slots):
-
-            first_tomorrow_slot = schedule.tomorrow.slots[0]
-
-            if first_tomorrow_slot.start == 0:
-                tomorrow_date = now_kyiv + timedelta(days=1)
-
-                if current_slot.type == first_tomorrow_slot.type:
-                    next_time = tomorrow_date.replace(
-                        hour=first_tomorrow_slot.end // 60,
-                        minute=first_tomorrow_slot.end % 60,
-                        second=0,
-                        microsecond=0
-                    )
-                    if len(schedule.tomorrow.slots) > 1:
-                        next_slot = schedule.tomorrow.slots[1]
-                        return (next_time, next_slot.is_power_off())
-                    return None
-                else:
-                    next_time = tomorrow_date.replace(hour=0, minute=0, second=0, microsecond=0)
-                    return (next_time, first_tomorrow_slot.is_power_off())
-
+        periods = schedule.get_outage_periods()
+        for start, end in periods:
+            if end > current_minute:
+                return (start, end)
         return None
+
+    def get_current_schedule(self) -> tuple[Optional[DtekCurrentOutage], Optional[DtekDaySchedule], Optional[DtekDaySchedule]]:
+        return self._saved_current, self._saved_today, self._saved_tomorrow
 
 
 class PowerMonitor:
@@ -1281,12 +985,14 @@ class PowerMonitor:
         self.config = config
         self.ha = HomeAssistantClient(config.ws_url, config.ha_token)
         self.db = Database(config.database_url)
-        self.yasno = YasnoAPIClient(YASNO_REGION, YASNO_DSO, YASNO_GROUP)
         self.notifier = NotificationService(config.bot_token, config.chat_ids)
-        self.yasno_monitor: Optional[YasnoScheduleMonitor] = None
+        self.dtek_monitor: Optional[DtekScheduleMonitor] = None
         self.current_state: Optional[PowerState] = None
         self._shutdown = asyncio.Event()
         self._cleanup_done = False
+
+    def is_power_off(self) -> bool:
+        return self.current_state is not None and not self.current_state.is_power_on()
 
     async def run(self) -> None:
         logger.info("🚀 Power Monitor started")
@@ -1296,13 +1002,8 @@ class PowerMonitor:
             await self.db.connect()
             await self.notifier.start()
 
-            self.yasno_monitor = YasnoScheduleMonitor(
-                self.yasno,
-                self.db,
-                self.notifier,
-                self
-            )
-            await self.yasno_monitor.start()
+            self.dtek_monitor = DtekScheduleMonitor(self.db, self.notifier, self)
+            await self.dtek_monitor.start()
 
             await self._main_loop()
         except Exception as e:
@@ -1422,9 +1123,9 @@ class PowerMonitor:
 
         is_unplanned_outage = False
         if not new_state.is_power_on():
-            is_unplanned_outage = await self._check_if_unplanned_outage()
+            is_unplanned_outage = self._check_if_unplanned_outage()
 
-        next_event_info = await self._get_next_event_info(new_state.is_power_on())
+        next_event_info = self._get_next_event_info(new_state.is_power_on())
 
         if new_state.is_power_on():
             message = (
@@ -1458,173 +1159,103 @@ class PowerMonitor:
         except Exception as e:
             logger.error(f"❌ Failed to save event to DB: {e}")
 
-    async def _check_if_unplanned_outage(self) -> bool:
-        try:
-            schedule = await self.yasno.fetch_schedule()
-            if not schedule:
-                return False
-
-            if schedule.today.status == ScheduleStatus.EMERGENCY_SHUTDOWNS.value:
-                return False
-
-            if not schedule.today.slots:
-                return False
-
-            now_kyiv = datetime.now(KYIV_TZ)
-            current_minute = now_kyiv.hour * 60 + now_kyiv.minute
-
-            current_slot = schedule.today.get_slot_at_minute(current_minute)
-            if current_slot and current_slot.is_power_off():
-                return False
-
-            next_outage_minute = None
-            for slot in schedule.today.slots:
-                if slot.start > current_minute and slot.is_power_off():
-                    next_outage_minute = slot.start
-                    break
-
-            if next_outage_minute is None:
-                if (schedule.tomorrow and
-                    schedule.tomorrow.status == ScheduleStatus.SCHEDULE_APPLIES.value and
-                    schedule.tomorrow.slots):
-                    for slot in schedule.tomorrow.slots:
-                        if slot.is_power_off():
-                            next_outage_minute = MINUTES_IN_DAY + slot.start
-                            break
-
-            if next_outage_minute is None:
-                return True
-
-            minutes_until_outage = next_outage_minute - current_minute
-
-            if minutes_until_outage > UNPLANNED_OUTAGE_THRESHOLD_MINUTES:
-                logger.info(f"🔍 Unplanned outage detected: next scheduled outage in {minutes_until_outage} minutes")
-                return True
-
+    def _check_if_unplanned_outage(self) -> bool:
+        if not self.dtek_monitor:
             return False
 
-        except Exception as e:
-            logger.error(f"❌ Error checking if unplanned outage: {e}")
+        current_outage, today, tomorrow = self.dtek_monitor.get_current_schedule()
+
+        if current_outage and current_outage.is_emergency:
             return False
 
-    async def _get_next_event_info(self, power_is_on: bool) -> Optional[str]:
-        try:
-            schedule = await self.yasno.fetch_schedule()
-            if not schedule:
-                return None
+        if not today:
+            return False
 
-            if schedule.today.status == ScheduleStatus.EMERGENCY_SHUTDOWNS.value:
+        now_kyiv = datetime.now(KYIV_TZ)
+        current_minute = now_kyiv.hour * 60 + now_kyiv.minute
+
+        if today.is_outage_at_minute(current_minute):
+            return False
+
+        next_outage_minute = None
+        periods = today.get_outage_periods()
+        for start, end in periods:
+            if start > current_minute:
+                next_outage_minute = start
+                break
+
+        if next_outage_minute is None and tomorrow:
+            tomorrow_periods = tomorrow.get_outage_periods()
+            if tomorrow_periods:
+                next_outage_minute = MINUTES_IN_DAY + tomorrow_periods[0][0]
+
+        if next_outage_minute is None:
+            return True
+
+        minutes_until_outage = next_outage_minute - current_minute
+
+        if minutes_until_outage > UNPLANNED_OUTAGE_THRESHOLD_MINUTES:
+            logger.info(f"🔍 Unplanned outage detected: next scheduled outage in {minutes_until_outage} minutes")
+            return True
+
+        return False
+
+    def _get_next_event_info(self, power_is_on: bool) -> Optional[str]:
+        if not self.dtek_monitor:
+            return None
+
+        current_outage, today, tomorrow = self.dtek_monitor.get_current_schedule()
+
+        if current_outage and current_outage.is_emergency:
+            if power_is_on:
+                return "🚨 Emergency shutdowns in effect"
+            else:
+                if current_outage.restoration_time:
+                    formatted_time = format_restoration_time(current_outage.restoration_time)
+                    return f"🚨 Next possible connection: **{formatted_time}**"
                 return "🚨 Emergency shutdowns in effect"
 
-            now_kyiv = datetime.now(KYIV_TZ)
-            current_minute = now_kyiv.hour * 60 + now_kyiv.minute
+        if not today:
+            return None
 
-            next_event = self._find_next_relevant_event(schedule, now_kyiv, current_minute, power_is_on)
+        now_kyiv = datetime.now(KYIV_TZ)
+        current_minute = now_kyiv.hour * 60 + now_kyiv.minute
 
-            if next_event:
-                next_time, is_outage = next_event
+        if power_is_on:
+            periods = today.get_outage_periods()
+            for start, end in periods:
+                if start > current_minute:
+                    start_h, start_m = divmod(start, 60)
+                    end_h, end_m = divmod(end, 60)
+                    if end == MINUTES_IN_DAY:
+                        end_h, end_m = 0, 0
+                    return f"📅 Next outage: **{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}**"
 
-                if is_outage:
-                    next_outage = self.yasno_monitor._find_next_outage_slot(schedule, now_kyiv, current_minute, skip_current=power_is_on) if self.yasno_monitor else None
-                    if next_outage:
-                        start_time, end_time, _ = next_outage
-                        start_str = start_time.strftime("%H:%M")
-                        end_str = end_time.strftime("%H:%M")
-                        return f"📅 Next outage: **{start_str}-{end_str}**"
-                    else:
-                        time_str = next_time.strftime("%H:%M")
-                        return f"📅 Next outage: **{time_str}**"
+            if tomorrow:
+                tomorrow_periods = tomorrow.get_outage_periods()
+                if tomorrow_periods:
+                    start, end = tomorrow_periods[0]
+                    start_h, start_m = divmod(start, 60)
+                    end_h, end_m = divmod(end, 60)
+                    return f"📅 Next outage: tomorrow **{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}**"
+
+            return "✅ No more outages scheduled for today"
+        else:
+            outage_end = today.get_current_outage_end(current_minute)
+            if outage_end:
+                if outage_end == MINUTES_IN_DAY:
+                    if tomorrow:
+                        tomorrow_periods = tomorrow.get_outage_periods()
+                        if tomorrow_periods and tomorrow_periods[0][0] == 0:
+                            end = tomorrow_periods[0][1]
+                            end_h, end_m = divmod(end, 60)
+                            return f"📅 Next connection: tomorrow **{end_h:02d}:{end_m:02d}**"
+                    return "📅 Next connection: **00:00**"
                 else:
-                    time_str = next_time.strftime("%H:%M")
-                    return f"📅 Next connection: **{time_str}**"
-
-            if power_is_on:
-                return "✅ No more outages scheduled for today"
-
-            if not power_is_on and (not schedule.tomorrow or schedule.tomorrow.status == ScheduleStatus.WAITING_FOR_SCHEDULE.value):
-                current_slot = schedule.today.get_slot_at_minute(current_minute)
-                if current_slot and current_slot.is_power_off():
-                    if current_slot.end == MINUTES_IN_DAY:
-                        return "📅 Next connection: **00:00**"
-                    else:
-                        end_time = f"{current_slot.end // 60:02d}:{current_slot.end % 60:02d}"
-                        return f"📅 Next connection: **{end_time}**"
+                    end_h, end_m = divmod(outage_end, 60)
+                    return f"📅 Next connection: **{end_h:02d}:{end_m:02d}**"
 
             return None
-
-        except Exception as e:
-            logger.error(f"❌ Error getting next event info: {e}")
-            return None
-
-    def _find_next_relevant_event(
-        self,
-        schedule: YasnoSchedule,
-        now_kyiv: datetime,
-        current_minute: int,
-        power_is_on: bool
-    ) -> Optional[tuple[datetime, bool]]:
-        for i, slot in enumerate(schedule.today.slots):
-            if slot.end > current_minute:
-                if slot.start > current_minute:
-                    if (power_is_on and slot.is_power_off()) or (not power_is_on and not slot.is_power_off()):
-                        next_time = now_kyiv.replace(
-                            hour=slot.start // 60,
-                            minute=slot.start % 60,
-                            second=0,
-                            microsecond=0
-                        )
-                        return (next_time, slot.is_power_off())
-
-                if slot.end < MINUTES_IN_DAY and i + 1 < len(schedule.today.slots):
-                    next_slot = schedule.today.slots[i + 1]
-                    if (power_is_on and next_slot.is_power_off()) or (not power_is_on and not next_slot.is_power_off()):
-                        next_time = now_kyiv.replace(
-                            hour=slot.end // 60,
-                            minute=slot.end % 60,
-                            second=0,
-                            microsecond=0
-                        )
-                        return (next_time, next_slot.is_power_off())
-
-        current_slot = schedule.today.get_slot_at_minute(current_minute)
-        if not current_slot:
-            return None
-
-        if (schedule.tomorrow and
-            schedule.tomorrow.status == ScheduleStatus.SCHEDULE_APPLIES.value and
-            schedule.tomorrow.slots):
-
-            tomorrow_date = now_kyiv + timedelta(days=1)
-            first_tomorrow_slot = schedule.tomorrow.slots[0]
-
-            if first_tomorrow_slot.start == 0:
-                if current_slot.type == first_tomorrow_slot.type:
-                    if len(schedule.tomorrow.slots) > 1:
-                        next_slot = schedule.tomorrow.slots[1]
-                        if (power_is_on and next_slot.is_power_off()) or (not power_is_on and not next_slot.is_power_off()):
-                            next_time = tomorrow_date.replace(
-                                hour=first_tomorrow_slot.end // 60,
-                                minute=first_tomorrow_slot.end % 60,
-                                second=0,
-                                microsecond=0
-                            )
-                            return (next_time, next_slot.is_power_off())
-                else:
-                    if (power_is_on and first_tomorrow_slot.is_power_off()) or (not power_is_on and not first_tomorrow_slot.is_power_off()):
-                        next_time = tomorrow_date.replace(hour=0, minute=0, second=0, microsecond=0)
-                        return (next_time, first_tomorrow_slot.is_power_off())
-
-            for slot in schedule.tomorrow.slots:
-                if (power_is_on and slot.is_power_off()) or (not power_is_on and not slot.is_power_off()):
-                    next_time = tomorrow_date.replace(
-                        hour=slot.start // 60,
-                        minute=slot.start % 60,
-                        second=0,
-                        microsecond=0
-                    )
-                    return (next_time, slot.is_power_off())
-
-        return None
 
     def _parse_power_state(self, state: dict) -> PowerStatus:
         try:
@@ -1672,11 +1303,10 @@ class PowerMonitor:
 
         cleanup_tasks = []
 
-        if self.yasno_monitor:
-            cleanup_tasks.append(('Yasno monitor', self.yasno_monitor.stop()))
+        if self.dtek_monitor:
+            cleanup_tasks.append(('DTEK monitor', self.dtek_monitor.stop()))
 
         cleanup_tasks.extend([
-            ('Yasno client', self.yasno.close()),
             ('Home Assistant', self.ha.close()),
             ('Database', self.db.close()),
             ('Notifier', self.notifier.stop())
