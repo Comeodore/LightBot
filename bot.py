@@ -1206,20 +1206,48 @@ class PowerMonitor:
 
         current_outage, today, tomorrow = self.dtek_monitor.get_current_schedule()
 
+        now_kyiv = datetime.now(KYIV_TZ)
+        current_minute = now_kyiv.hour * 60 + now_kyiv.minute
+
         if current_outage and current_outage.is_emergency:
             if power_is_on:
+                next_outage_info = None
+                if today:
+                    periods = today.get_outage_periods()
+                    for start, end in periods:
+                        if start > current_minute:
+                            start_h, start_m = divmod(start, 60)
+                            end_h, end_m = divmod(end, 60)
+                            if end == MINUTES_IN_DAY:
+                                end_h, end_m = 0, 0
+                            next_outage_info = f"📅 Next possible outage: **{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}**"
+                            break
+
+                    if not next_outage_info and tomorrow:
+                        tomorrow_periods = tomorrow.get_outage_periods()
+                        if tomorrow_periods:
+                            start, end = tomorrow_periods[0]
+                            start_h, start_m = divmod(start, 60)
+                            end_h, end_m = divmod(end, 60)
+                            if end == MINUTES_IN_DAY:
+                                end_h, end_m = 0, 0
+                            next_outage_info = f"📅 Next possible outage: tomorrow **{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}**"
+
+                if next_outage_info:
+                    return f"🚨 Emergency shutdowns in effect\n{next_outage_info}"
+                
+                if today and not tomorrow:
+                    return "🚨 Emergency shutdowns in effect, but no outages scheduled for today"
+                
                 return "🚨 Emergency shutdowns in effect"
             else:
                 if current_outage.restoration_time:
                     formatted_time = format_restoration_time(current_outage.restoration_time)
-                    return f"🚨 Next possible connection: **{formatted_time}**"
+                    return f"🚨 Emergency shutdowns in effect, next possible connection: **{formatted_time}**"
                 return "🚨 Emergency shutdowns in effect"
 
         if not today:
             return None
-
-        now_kyiv = datetime.now(KYIV_TZ)
-        current_minute = now_kyiv.hour * 60 + now_kyiv.minute
 
         if power_is_on:
             periods = today.get_outage_periods()
@@ -1237,6 +1265,8 @@ class PowerMonitor:
                     start, end = tomorrow_periods[0]
                     start_h, start_m = divmod(start, 60)
                     end_h, end_m = divmod(end, 60)
+                    if end == MINUTES_IN_DAY:
+                        end_h, end_m = 0, 0
                     return f"📅 Next outage: tomorrow **{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}**"
 
             return "✅ No more outages scheduled for today"
