@@ -710,7 +710,7 @@ class DtekScheduleMonitor:
         tomorrow_cancelled = saved_tomorrow_had_outages and not tomorrow_has_outages
 
         if tomorrow_published:
-            await self._handle_tomorrow_update(tomorrow, now_kyiv, current_minute, is_new=True)
+            await self._handle_tomorrow_update(tomorrow, today, now_kyiv, current_minute, is_new=True)
             await self._check_today_changes(today, now_kyiv, current_minute, tomorrow_has_outages=True)
         elif tomorrow_cancelled:
             is_new_day = self._saved_today and today and self._saved_today.date != today.date
@@ -925,6 +925,7 @@ class DtekScheduleMonitor:
     async def _handle_tomorrow_update(
         self,
         tomorrow: DtekDaySchedule,
+        today: DtekDaySchedule,
         now_kyiv: datetime,
         current_minute: int,
         is_new: bool = False
@@ -944,9 +945,34 @@ class DtekScheduleMonitor:
         total_minutes = sum(end - start for start, end in outage_periods)
         logger.info(f"📅 Sent tomorrow schedule update with {len(outage_periods)} outage periods ({self._format_duration_hours(total_minutes)} total)")
 
-        next_outage = self._find_next_outage_period(tomorrow, 0)
-        if next_outage:
-            start, end = next_outage
+        next_outage_today = self._find_next_outage_period(today, current_minute) if today else None
+        next_outage_tomorrow = self._find_next_outage_period(tomorrow, 0)
+
+        if next_outage_today:
+            start, end = next_outage_today
+            if end == MINUTES_IN_DAY and today:
+                periods = today.get_outage_periods()
+                for i, (p_start, p_end) in enumerate(periods):
+                    if p_start == start and p_end == MINUTES_IN_DAY:
+                        if i + 1 < len(periods) and periods[i + 1][0] == 0:
+                            end = periods[i + 1][1]
+                        break
+            
+            start_str = f"{start // 60:02d}:{start % 60:02d}"
+            if end == MINUTES_IN_DAY:
+                end_str = "00:00"
+            elif end < start:
+                end_str = f"{end // 60:02d}:{end % 60:02d}"
+            else:
+                end_h, end_m = end // 60, end % 60
+                end_str = f"{end_h:02d}:{end_m:02d}"
+
+            message = (
+                f"📅 **Tomorrow schedule published**\n\n"
+                f"Next outage: **{start_str} - {end_str}**"
+            )
+        elif next_outage_tomorrow:
+            start, end = next_outage_tomorrow
             start_str = f"{start // 60:02d}:{start % 60:02d}"
             end_h, end_m = (0, 0) if end == MINUTES_IN_DAY else (end // 60, end % 60)
             end_str = f"{end_h:02d}:{end_m:02d}"
@@ -955,9 +981,11 @@ class DtekScheduleMonitor:
                 f"📅 **Tomorrow schedule published**\n\n"
                 f"Next outage: **tomorrow {start_str} - {end_str}**"
             )
+        else:
+            return
 
-            await self.notifier.send_reply_to_pinned(message)
-            logger.info(f"📅 Sent tomorrow schedule notification: tomorrow {start_str} - {end_str}")
+        await self.notifier.send_reply_to_pinned(message)
+        logger.info(f"📅 Sent tomorrow schedule notification: {message.split('Next outage: ')[1] if 'Next outage:' in message else 'no outages'}")
 
     def _find_next_outage_period(
         self,
