@@ -132,11 +132,8 @@ class DtekScheduleMonitor:
     async def _load_initial_state(self) -> None:
         data = await self.db.get_dtek_schedule()
         if data:
-            self._state = ScheduleState(
-                current_outage=DtekCurrentOutage.from_dict(data.get("current_outage")),
-                today=DtekDaySchedule.from_dict(data.get("today")),
-                tomorrow=DtekDaySchedule.from_dict(data.get("tomorrow")),
-            )
+            now = datetime.now(KYIV_TZ)
+            self._state = self._build_validated_state(data, now)
             logger.info("📊 Initial DTEK schedule loaded from DB")
         else:
             logger.info("📊 No DTEK schedule in DB yet")
@@ -166,13 +163,13 @@ class DtekScheduleMonitor:
         if not data:
             return
 
-        new_state = ScheduleState(
-            current_outage=DtekCurrentOutage.from_dict(data.get("current_outage")),
-            today=DtekDaySchedule.from_dict(data.get("today")),
-            tomorrow=DtekDaySchedule.from_dict(data.get("tomorrow")),
-        )
+        now = datetime.now(KYIV_TZ)
+        new_state = self._build_validated_state(data, now)
+
+        await self._check_outage_changes(new_state)
 
         if not new_state.today:
+            self._state = new_state
             return
 
         if self._state.today is None:
@@ -180,13 +177,32 @@ class DtekScheduleMonitor:
             logger.info("📅 Initial DTEK schedule state set")
             return
 
-        now = datetime.now(KYIV_TZ)
         current_minute = now.hour * 60 + now.minute
-
-        await self._check_outage_changes(new_state)
         await self._handle_schedule_changes(new_state, now, current_minute)
 
         self._state = new_state
+
+    def _build_validated_state(self, data: dict, now: datetime) -> ScheduleState:
+        current_outage = DtekCurrentOutage.from_dict(data.get("current_outage"))
+        today = DtekDaySchedule.from_dict(data.get("today"))
+        tomorrow = DtekDaySchedule.from_dict(data.get("tomorrow"))
+
+        expected_today = now.strftime("%d.%m.%y")
+        expected_tomorrow = (now + timedelta(days=1)).strftime("%d.%m.%y")
+
+        if today and today.date != expected_today:
+            # logger.warning(f"Stale today schedule: {today.date} != {expected_today}, ignoring")
+            today = None
+
+        if tomorrow and tomorrow.date != expected_tomorrow:
+            # logger.warning(f"Stale tomorrow schedule: {tomorrow.date} != {expected_tomorrow}, ignoring")
+            tomorrow = None
+
+        return ScheduleState(
+            current_outage=current_outage,
+            today=today,
+            tomorrow=tomorrow,
+        )
 
     async def _check_outage_changes(self, new_state: ScheduleState) -> None:
         if not self.power_monitor.is_power_off():
