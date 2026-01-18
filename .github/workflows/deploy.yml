@@ -29,7 +29,3 @@ jobs:
 
       - name: Cleanup old images
         run: docker image prune -af
-
-      - name: Show logs
-        run: docker logs --tail=50 lightbot
-

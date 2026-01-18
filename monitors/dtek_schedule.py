@@ -456,13 +456,10 @@ class DtekScheduleMonitor:
             next_today = today.find_next_period(current_minute)
             if next_today:
                 start, end = next_today
-                if end == MINUTES_IN_DAY:
-                    periods = today.get_outage_periods()
-                    for i, (p_start, p_end) in enumerate(periods):
-                        if p_start == start and p_end == MINUTES_IN_DAY:
-                            if i + 1 < len(periods) and periods[i + 1][0] == 0:
-                                end = periods[i + 1][1]
-                            break
+                if end == MINUTES_IN_DAY and tomorrow:
+                    tomorrow_periods = tomorrow.get_outage_periods()
+                    if tomorrow_periods and tomorrow_periods[0][0] == 0:
+                        return f"{minutes_to_time(start)} - tomorrow {minutes_to_time(tomorrow_periods[0][1])}"
                 return f"{minutes_to_time(start)} - {minutes_to_time(end)}"
 
         if tomorrow:

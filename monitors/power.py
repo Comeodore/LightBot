@@ -135,12 +135,17 @@ class NextEventInfoBuilder:
         if self.today:
             next_period = self.today.find_next_period(self.current_minute)
             if next_period:
-                return f"📅 Next possible outage: *{self._format_period(*next_period)}*"
+                start, end = next_period
+                if end == MINUTES_IN_DAY and self.tomorrow:
+                    tomorrow_periods = self.tomorrow.get_outage_periods()
+                    if tomorrow_periods and tomorrow_periods[0][0] == 0:
+                        return f"📅 Next outage: *{minutes_to_time(start)} - tomorrow {minutes_to_time(tomorrow_periods[0][1])}*"
+                return f"📅 Next  outage: *{self._format_period(*next_period)}*"
 
         if self.tomorrow:
             next_period = self.tomorrow.find_next_period(0)
             if next_period:
-                return f"📅 Next possible outage: tomorrow *{self._format_period(*next_period)}*"
+                return f"📅 Next outage: tomorrow *{self._format_period(*next_period)}*"
 
         return None
 
