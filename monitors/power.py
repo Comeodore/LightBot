@@ -326,7 +326,11 @@ class PowerMonitor:
             logger.info(f"🔴 Power lost {log_suffix} after {duration}")
 
         self.current_state = new_state
-        await self.notifier.send(message)
+        
+        try:
+            await self.notifier.send(message)
+        except Exception as e:
+            logger.error(f"Failed to send notification: {e}")
 
         try:
             await self.db.save_event(new_state)

@@ -48,7 +48,10 @@ class NotificationService:
                 logger.warning(f"No pinned message found in {chat_id}, skipping edit")
                 continue
 
-            await self._edit_message(chat_id, pinned_message_id, message)
+            try:
+                await self._edit_message(chat_id, pinned_message_id, message)
+            except Exception as e:
+                logger.error(f"Failed to edit pinned message in {chat_id}: {e}")
 
     async def send_reply_to_pinned(self, message: str) -> None:
         for chat_id in self.chat_ids:
@@ -60,7 +63,10 @@ class NotificationService:
                 await self._send_to_chat(chat_id, message)
                 continue
 
-            await self._send_reply(chat_id, message, pinned_message_id)
+            try:
+                await self._send_reply(chat_id, message, pinned_message_id)
+            except Exception as e:
+                logger.error(f"Failed to send reply to pinned in {chat_id}: {e}")
 
     async def _unpin_all_messages(self) -> None:
         for chat_id in self.chat_ids:

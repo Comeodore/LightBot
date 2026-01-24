@@ -226,16 +226,19 @@ class DtekScheduleMonitor:
             logger.info(f"Current outage changed (power on): {new_state.current_outage}")
 
     async def _handle_new_outage_info(self, outage: DtekCurrentOutage) -> None:
-        if outage.is_emergency:
-            await self.notifier.send(
-                self._msg.emergency_detected(outage.restoration_time)
-            )
-            logger.info(f"🚨 Emergency detected: restoration_time={outage.restoration_time}")
-        elif outage.is_scheduled:
-            await self.notifier.send(
-                self._msg.outage_type_detected("Scheduled outage", outage.restoration_time)
-            )
-            logger.info(f"⚡️ Scheduled outage detected: restoration_time={outage.restoration_time}")
+        try:
+            if outage.is_emergency:
+                await self.notifier.send(
+                    self._msg.emergency_detected(outage.restoration_time)
+                )
+                logger.info(f"🚨 Emergency detected: restoration_time={outage.restoration_time}")
+            elif outage.is_scheduled:
+                await self.notifier.send(
+                    self._msg.outage_type_detected("Scheduled outage", outage.restoration_time)
+                )
+                logger.info(f"⚡️ Scheduled outage detected: restoration_time={outage.restoration_time}")
+        except Exception as e:
+            logger.error(f"Failed to send outage notification: {e}")
 
     async def _handle_outage_info_update(
         self,
@@ -244,10 +247,13 @@ class DtekScheduleMonitor:
         new_state: ScheduleState,
     ) -> None:
         if old_outage.restoration_time != new_outage.restoration_time:
-            await self.notifier.send(
-                self._msg.restoration_time_updated(new_outage.restoration_time)
-            )
-            logger.info(f"🔄 Restoration time changed: {new_outage.restoration_time}")
+            try:
+                await self.notifier.send(
+                    self._msg.restoration_time_updated(new_outage.restoration_time)
+                )
+                logger.info(f"🔄 Restoration time changed: {new_outage.restoration_time}")
+            except Exception as e:
+                logger.error(f"Failed to send restoration time update: {e}")
 
     async def _handle_schedule_changes(
         self, new_state: ScheduleState, now: datetime, current_minute: int
@@ -297,17 +303,21 @@ class DtekScheduleMonitor:
     ) -> None:
         tomorrow_date = (now + timedelta(days=1)).strftime("%d.%m")
         schedule_msg = self._msg.format_schedule(tomorrow_date, new_state.tomorrow)
-        await self.notifier.send(schedule_msg, pin=True, unpin_all_first=True)
+        
+        try:
+            await self.notifier.send(schedule_msg, pin=True, unpin_all_first=True)
 
-        next_outage_str = self._get_next_outage_string(
-            new_state.today, new_state.tomorrow, current_minute
-        )
-        if next_outage_str:
-            await self.notifier.send_reply_to_pinned(
-                self._msg.tomorrow_published(next_outage_str)
+            next_outage_str = self._get_next_outage_string(
+                new_state.today, new_state.tomorrow, current_minute
             )
+            if next_outage_str:
+                await self.notifier.send_reply_to_pinned(
+                    self._msg.tomorrow_published(next_outage_str)
+                )
 
-        logger.info(f"📅 Sent tomorrow schedule: {tomorrow_date}")
+            logger.info(f"📅 Sent tomorrow schedule: {tomorrow_date}")
+        except Exception as e:
+            logger.error(f"Failed to send tomorrow published notification: {e}")
 
     async def _handle_tomorrow_cancelled(
         self,
@@ -323,8 +333,11 @@ class DtekScheduleMonitor:
             return
 
         tomorrow_date = (now + timedelta(days=1)).strftime("%d.%m")
-        await self.notifier.send(self._msg.tomorrow_cancelled(tomorrow_date))
-        logger.info("✅ Tomorrow outages cancelled")
+        try:
+            await self.notifier.send(self._msg.tomorrow_cancelled(tomorrow_date))
+            logger.info("✅ Tomorrow outages cancelled")
+        except Exception as e:
+            logger.error(f"Failed to send tomorrow cancelled notification: {e}")
 
         await self._update_pinned_if_changed(new_state.today, now, is_tomorrow=False)
         await self._check_today_changes(new_state, now, current_minute, False)
@@ -334,20 +347,24 @@ class DtekScheduleMonitor:
     ) -> None:
         tomorrow_date = (now + timedelta(days=1)).strftime("%d.%m")
         schedule_msg = self._msg.format_schedule(tomorrow_date, new_state.tomorrow)
-        await self.notifier.edit_pinned_message(schedule_msg)
+        
+        try:
+            await self.notifier.edit_pinned_message(schedule_msg)
 
-        next_period = new_state.tomorrow.find_next_period(0)
-        next_outage_str = (
-            f"tomorrow {format_period(next_period[0], next_period[1])}"
-            if next_period
-            else None
-        )
-        await self.notifier.send_reply_to_pinned(
-            self._msg.schedule_updated("Tomorrow", tomorrow_date, next_outage_str)
-        )
+            next_period = new_state.tomorrow.find_next_period(0)
+            next_outage_str = (
+                f"tomorrow {format_period(next_period[0], next_period[1])}"
+                if next_period
+                else None
+            )
+            await self.notifier.send_reply_to_pinned(
+                self._msg.schedule_updated("Tomorrow", tomorrow_date, next_outage_str)
+            )
+            logger.info(f"📅 Tomorrow schedule changed: {tomorrow_date}")
+        except Exception as e:
+            logger.error(f"Failed to send tomorrow changed notification: {e}")
 
         await self._check_today_changes(new_state, now, current_minute, True)
-        logger.info(f"📅 Tomorrow schedule changed: {tomorrow_date}")
 
     async def _update_pinned_if_changed(
         self, schedule: DtekDaySchedule, now: datetime, is_tomorrow: bool
@@ -362,8 +379,11 @@ class DtekScheduleMonitor:
             else now.strftime("%d.%m")
         )
         schedule_msg = self._msg.format_schedule(date_str, schedule)
-        await self.notifier.edit_pinned_message(schedule_msg)
-        logger.info(f"📌 Updated pinned with {'tomorrow' if is_tomorrow else 'today'} schedule")
+        try:
+            await self.notifier.edit_pinned_message(schedule_msg)
+            logger.info(f"📌 Updated pinned with {'tomorrow' if is_tomorrow else 'today'} schedule")
+        except Exception as e:
+            logger.error(f"Failed to update pinned message: {e}")
 
     async def _check_today_changes(
         self,
@@ -412,8 +432,11 @@ class DtekScheduleMonitor:
 
         if old_slot_end != new_slot_end and new_slot_end:
             slot_end_str = minutes_to_time(new_slot_end)
-            await self.notifier.send(self._msg.slot_end_updated(slot_end_str))
-            logger.info(f"🕐 Slot end changed: {slot_end_str}")
+            try:
+                await self.notifier.send(self._msg.slot_end_updated(slot_end_str))
+                logger.info(f"🕐 Slot end changed: {slot_end_str}")
+            except Exception as e:
+                logger.error(f"Failed to send slot end update: {e}")
         else:
             logger.info("📅 Schedule changed during outage, but current slot unchanged")
 
@@ -439,12 +462,14 @@ class DtekScheduleMonitor:
         next_outage_str = format_period(*current_next) if current_next else None
         msg = self._msg.schedule_updated("Today", date_str, next_outage_str)
 
-        if tomorrow_has_outages:
-            await self.notifier.send(msg)
-        else:
-            await self.notifier.send_reply_to_pinned(msg)
-
-        logger.info("📅 Sent today schedule change notification")
+        try:
+            if tomorrow_has_outages:
+                await self.notifier.send(msg)
+            else:
+                await self.notifier.send_reply_to_pinned(msg)
+            logger.info("📅 Sent today schedule change notification")
+        except Exception as e:
+            logger.error(f"Failed to send today schedule change notification: {e}")
 
     def _get_next_outage_string(
         self,
