@@ -205,8 +205,10 @@ class DtekScheduleMonitor:
         )
 
     async def _check_outage_changes(self, new_state: ScheduleState) -> None:
+        # Log status mismatch when data changes
+        self._log_status_mismatch_if_changed(new_state)
+        
         if not self.power_monitor.is_power_off():
-            self._log_outage_changes(new_state)
             return
 
         had_outage = self._state.current_outage and self._state.current_outage.is_outage
@@ -221,9 +223,19 @@ class DtekScheduleMonitor:
                 self._state.current_outage, new_state.current_outage, new_state
             )
 
-    def _log_outage_changes(self, new_state: ScheduleState) -> None:
-        if new_state.current_outage != self._state.current_outage:
-            logger.info(f"Current outage changed (power on): {new_state.current_outage}")
+    def _log_status_mismatch_if_changed(self, new_state: ScheduleState) -> None:
+        # Only log when outage data actually changes
+        if new_state.current_outage == self._state.current_outage:
+            return
+        
+        power_is_off = self.power_monitor.is_power_off()
+        site_has_outage = new_state.current_outage and new_state.current_outage.is_outage
+        site_status = new_state.current_outage.status if new_state.current_outage else "power_on"
+        
+        if power_is_off and not site_has_outage:
+            logger.info(f"⚠️ Status mismatch: power OFF but site shows '{site_status}', last updated: {new_state.current_outage.last_updated}")
+        elif not power_is_off and site_has_outage:
+            logger.info(f"⚠️ Status mismatch: power ON but site shows '{site_status}', last updated: {new_state.current_outage.last_updated}")
 
     async def _handle_new_outage_info(self, outage: DtekCurrentOutage) -> None:
         try:
