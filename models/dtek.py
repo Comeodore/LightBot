@@ -143,8 +143,9 @@ class DtekDaySchedule:
         return None
 
     def find_next_period(self, after_minute: int = 0) -> Optional[tuple[int, int]]:
+        """Find next outage period that starts after the given minute."""
         for start, end in self.get_outage_periods():
-            if end > after_minute:
+            if start > after_minute:
                 return (start, end)
         return None
 
