@@ -7,16 +7,11 @@ from typing import Optional, TYPE_CHECKING
 
 from config import Config
 from models.power import PowerStatus, PowerState
-from models.dtek import DtekCurrentOutage, DtekDaySchedule
+from models.dtek import DtekDaySchedule, OutagePeriodFormatter
 from services.home_assistant import HomeAssistantClient
 from services.database import Database
 from services.notifications import NotificationService
-from utils.time_format import (
-    KYIV_TZ,
-    MINUTES_IN_DAY,
-    minutes_to_time,
-    format_duration,
-)
+from utils.time_format import KYIV_TZ, MINUTES_IN_DAY, format_duration
 
 if TYPE_CHECKING:
     from monitors.dtek_schedule import DtekScheduleMonitor
@@ -28,130 +23,28 @@ UNPLANNED_OUTAGE_THRESHOLD_MINUTES = 60
 
 class PowerMessageBuilder:
     @staticmethod
-    def power_restored(
-        duration: str, battery: str, next_info: Optional[str]
-    ) -> str:
+    def power_restored(duration: str, battery: str, next_outage: Optional[str]) -> str:
         msg = (
             f"🟢 *POWER RESTORED*\n\n"
             f"⏱ Outage duration: *{duration}*\n"
             f"🔋 Battery: *{battery}*"
         )
-        if next_info:
-            msg += f"\n\n{next_info}"
+        if next_outage:
+            msg += f"\n\n📅 Next outage: *{next_outage}*"
         return msg
 
     @staticmethod
-    def power_outage(
-        uptime: str, battery: str, is_unplanned: bool, next_info: Optional[str]
-    ) -> str:
+    def power_outage(uptime: str, battery: str, is_unplanned: bool, slot_end: Optional[str]) -> str:
         msg = (
             f"🔴 *POWER OUTAGE*\n\n"
             f"⏱ Uptime: *{uptime}*\n"
             f"🔋 Battery: *{battery}*"
         )
         if is_unplanned:
-            msg += "\n\n⚠️ *Unscheduled outage*"
-        elif next_info:
-            msg += f"\n\n{next_info}"
+            msg += "\n\n⚠️ Unscheduled outage"
+        elif slot_end:
+            msg += f"\n\n🕐 Restoration: *{slot_end}*"
         return msg
-
-
-class NextEventInfoBuilder:
-    def __init__(
-        self,
-        current_outage: Optional[DtekCurrentOutage],
-        today: Optional[DtekDaySchedule],
-        tomorrow: Optional[DtekDaySchedule],
-        current_minute: int,
-    ):
-        self.current_outage = current_outage
-        self.today = today
-        self.tomorrow = tomorrow
-        self.current_minute = current_minute
-
-    def get_info(self, power_is_on: bool) -> Optional[str]:
-        if power_is_on:
-            return self._get_power_on_info()
-        else:
-            return self._get_power_off_info()
-
-    def _get_power_on_info(self) -> Optional[str]:
-        if self.current_outage and self.current_outage.is_emergency:
-            next_outage = self._find_next_outage_string()
-            if next_outage:
-                return f"🚨 Emergency shutdowns in effect\n{next_outage}"
-            return "🚨 Emergency shutdowns in effect"
-
-        if not self.today:
-            return None
-
-        next_period = self.today.find_next_period(self.current_minute)
-        if next_period:
-            return f"📅 Next outage: *{self._format_period(*next_period)}*"
-
-        if self.tomorrow:
-            next_period = self.tomorrow.find_next_period(0)
-            if next_period:
-                return f"📅 Next outage: tomorrow *{self._format_period(*next_period)}*"
-
-        return "✅ No more outages scheduled for today"
-
-    def _get_power_off_info(self) -> Optional[str]:
-        if self.current_outage and self.current_outage.is_emergency:
-            return self._get_emergency_restoration_info()
-
-        return self._get_scheduled_restoration_info()
-
-    def _get_emergency_restoration_info(self) -> Optional[str]:
-        if self.current_outage.restoration_time:
-            return f"🚨 Emergency shutdown\n🕐 Restoration: *{self.current_outage.restoration_time}*"
-        return "🚨 Emergency shutdown"
-
-    def _get_scheduled_restoration_info(self) -> Optional[str]:
-        slot_end = self._get_slot_end_time()
-        if slot_end:
-            return f"🕐 Next connection: *{slot_end}*"
-        return None
-
-    def _get_slot_end_time(self) -> Optional[str]:
-        if not self.today:
-            return None
-
-        outage_end = self.today.get_current_outage_end(self.current_minute)
-        if not outage_end:
-            return None
-
-        if outage_end == MINUTES_IN_DAY:
-            if self.tomorrow:
-                tomorrow_periods = self.tomorrow.get_outage_periods()
-                if tomorrow_periods and tomorrow_periods[0][0] == 0:
-                    end = tomorrow_periods[0][1]
-                    return f"tomorrow {minutes_to_time(end)}"
-            return "00:00"
-
-        return minutes_to_time(outage_end)
-
-    def _find_next_outage_string(self) -> Optional[str]:
-        if self.today:
-            next_period = self.today.find_next_period(self.current_minute)
-            if next_period:
-                start, end = next_period
-                if end == MINUTES_IN_DAY and self.tomorrow:
-                    tomorrow_periods = self.tomorrow.get_outage_periods()
-                    if tomorrow_periods and tomorrow_periods[0][0] == 0:
-                        return f"📅 Next outage: *{minutes_to_time(start)} - tomorrow {minutes_to_time(tomorrow_periods[0][1])}*"
-                return f"📅 Next  outage: *{self._format_period(*next_period)}*"
-
-        if self.tomorrow:
-            next_period = self.tomorrow.find_next_period(0)
-            if next_period:
-                return f"📅 Next outage: tomorrow *{self._format_period(*next_period)}*"
-
-        return None
-
-    @staticmethod
-    def _format_period(start: int, end: int) -> str:
-        return f"{minutes_to_time(start)}-{minutes_to_time(end)}"
 
 
 class PowerMonitor:
@@ -308,20 +201,14 @@ class PowerMonitor:
     async def _handle_state_change(self, new_state: PowerState) -> None:
         duration = format_duration(self.current_state.timestamp, new_state.timestamp)
 
-        is_unplanned = (
-            self._check_if_unplanned_outage() if not new_state.is_power_on() else False
-        )
-        next_info = self._get_next_event_info(new_state.is_power_on())
-
         if new_state.is_power_on():
-            message = self._msg.power_restored(
-                duration, new_state.battery_level, next_info
-            )
+            next_outage = self._get_next_outage_string()
+            message = self._msg.power_restored(duration, new_state.battery_level, next_outage)
             logger.info(f"🟢 Power restored after {duration}")
         else:
-            message = self._msg.power_outage(
-                duration, new_state.battery_level, is_unplanned, next_info
-            )
+            is_unplanned = self._check_if_unplanned_outage()
+            slot_end = self._get_current_slot_end() if not is_unplanned else None
+            message = self._msg.power_outage(duration, new_state.battery_level, is_unplanned, slot_end)
             log_suffix = "(UNSCHEDULED)" if is_unplanned else ""
             logger.info(f"🔴 Power lost {log_suffix} after {duration}")
 
@@ -389,16 +276,27 @@ class PowerMonitor:
 
         return None
 
-    def _get_next_event_info(self, power_is_on: bool) -> Optional[str]:
+    def _get_next_outage_string(self) -> Optional[str]:
         if not self.dtek_monitor:
             return None
 
-        current_outage, today, tomorrow = self.dtek_monitor.get_current_schedule()
+        _, today, tomorrow = self.dtek_monitor.get_current_schedule()
         now = datetime.now(KYIV_TZ)
         current_minute = now.hour * 60 + now.minute
 
-        builder = NextEventInfoBuilder(current_outage, today, tomorrow, current_minute)
-        return builder.get_info(power_is_on)
+        formatter = OutagePeriodFormatter(today, tomorrow, current_minute)
+        return formatter.get_outage_string(power_is_off=False)
+
+    def _get_current_slot_end(self) -> Optional[str]:
+        if not self.dtek_monitor:
+            return None
+
+        _, today, tomorrow = self.dtek_monitor.get_current_schedule()
+        now = datetime.now(KYIV_TZ)
+        current_minute = now.hour * 60 + now.minute
+
+        formatter = OutagePeriodFormatter(today, tomorrow, current_minute)
+        return formatter.get_slot_end()
 
     @staticmethod
     def _parse_power_state(state: dict) -> PowerStatus:

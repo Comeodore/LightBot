@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from utils.time_format import MINUTES_IN_DAY, format_period
+from utils.time_format import MINUTES_IN_DAY, format_period, minutes_to_time
 
 
 class DtekCellStatus(Enum):
@@ -135,11 +135,10 @@ class DtekDaySchedule:
                 return True
         return False
 
-    def get_current_outage_end(self, minute: int) -> Optional[int]:
-        periods = self.get_outage_periods()
-        for start, end in periods:
+    def find_current_period(self, minute: int) -> Optional[tuple[int, int]]:
+        for start, end in self.get_outage_periods():
             if start <= minute < end:
-                return end
+                return (start, end)
         return None
 
     def find_next_period(self, after_minute: int = 0) -> Optional[tuple[int, int]]:
@@ -160,3 +159,63 @@ class DtekDaySchedule:
 
     def total_power_minutes(self) -> int:
         return MINUTES_IN_DAY - self.total_outage_minutes()
+
+
+class OutagePeriodFormatter:
+    def __init__(
+        self,
+        today: Optional[DtekDaySchedule],
+        tomorrow: Optional[DtekDaySchedule],
+        current_minute: int,
+    ):
+        self.today = today
+        self.tomorrow = tomorrow
+        self.current_minute = current_minute
+
+    def get_outage_string(self, power_is_off: bool) -> Optional[str]:
+        if power_is_off:
+            return self._format_current_outage()
+        return self._format_next_outage()
+
+    def _format_current_outage(self) -> Optional[str]:
+        if not self.today:
+            return None
+        period = self.today.find_current_period(self.current_minute)
+        if not period:
+            return None
+        return self._format_period_with_crossnight(period)
+
+    def _format_next_outage(self) -> Optional[str]:
+        if self.today:
+            period = self.today.find_next_period(self.current_minute)
+            if period:
+                return self._format_period_with_crossnight(period)
+
+        if self.tomorrow:
+            period = self.tomorrow.find_next_period(0)
+            if period:
+                return f"tomorrow {format_period(*period)}"
+
+        return None
+
+    def get_slot_end(self) -> Optional[str]:
+        if not self.today:
+            return None
+        period = self.today.find_current_period(self.current_minute)
+        if not period:
+            return None
+        _, end = period
+        if end == MINUTES_IN_DAY and self.tomorrow:
+            tomorrow_periods = self.tomorrow.get_outage_periods()
+            if tomorrow_periods and tomorrow_periods[0][0] == 0:
+                return f"tomorrow {minutes_to_time(tomorrow_periods[0][1])}"
+            return "00:00"
+        return minutes_to_time(end)
+
+    def _format_period_with_crossnight(self, period: tuple[int, int]) -> str:
+        start, end = period
+        if end == MINUTES_IN_DAY and self.tomorrow:
+            tomorrow_periods = self.tomorrow.get_outage_periods()
+            if tomorrow_periods and tomorrow_periods[0][0] == 0:
+                return f"{minutes_to_time(start)} - tomorrow {minutes_to_time(tomorrow_periods[0][1])}"
+        return format_period(start, end)
