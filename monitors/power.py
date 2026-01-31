@@ -2,23 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
 from config import Config
 from models.power import PowerStatus, PowerState
-from models.dtek import DtekDaySchedule, OutagePeriodFormatter
+from models.dtek import OutagePeriodFormatter
 from services.home_assistant import HomeAssistantClient
 from services.database import Database
 from services.notifications import NotificationService
-from utils.time_format import KYIV_TZ, MINUTES_IN_DAY, format_duration
+from utils.time_format import KYIV_TZ, format_duration
 
 if TYPE_CHECKING:
     from monitors.dtek_schedule import DtekScheduleMonitor
 
 logger = logging.getLogger(__name__)
-
-UNPLANNED_OUTAGE_THRESHOLD_MINUTES = 60
 
 
 class PowerMessageBuilder:
@@ -43,7 +41,7 @@ class PowerMessageBuilder:
         if is_unplanned:
             msg += "\n\n⚠️ Unscheduled outage"
         elif slot_end:
-            msg += f"\n\n🕐 Restoration: *{slot_end}*"
+            msg += f"\n\n⚡ Scheduled\n🕐 Restoration: *{slot_end}*"
         return msg
 
 
@@ -226,15 +224,12 @@ class PowerMonitor:
 
     def _check_if_unplanned_outage(self) -> bool:
         if not self.dtek_monitor:
-            return False
+            return True
 
-        current_outage, today, tomorrow = self.dtek_monitor.get_current_schedule()
-
-        if current_outage and current_outage.is_emergency:
-            return False
+        _, today, _ = self.dtek_monitor.get_current_schedule()
 
         if not today:
-            return False
+            return True
 
         now = datetime.now(KYIV_TZ)
         current_minute = now.hour * 60 + now.minute
@@ -242,39 +237,8 @@ class PowerMonitor:
         if today.is_outage_at_minute(current_minute):
             return False
 
-        next_outage_minute = self._find_next_outage_minute(
-            today, tomorrow, current_minute
-        )
-
-        if next_outage_minute is None:
-            return True
-
-        minutes_until = next_outage_minute - current_minute
-        if minutes_until > UNPLANNED_OUTAGE_THRESHOLD_MINUTES:
-            logger.info(
-                f"⚠️ Unplanned outage detected: next scheduled in {minutes_until} minutes"
-            )
-            return True
-
-        return False
-
-    def _find_next_outage_minute(
-        self,
-        today: DtekDaySchedule,
-        tomorrow: Optional[DtekDaySchedule],
-        current_minute: int,
-    ) -> Optional[int]:
-        periods = today.get_outage_periods()
-        for start, _ in periods:
-            if start > current_minute:
-                return start
-
-        if tomorrow:
-            tomorrow_periods = tomorrow.get_outage_periods()
-            if tomorrow_periods:
-                return MINUTES_IN_DAY + tomorrow_periods[0][0]
-
-        return None
+        logger.info(f"⚠️ Unplanned outage: not in schedule at minute {current_minute}")
+        return True
 
     def _get_next_outage_string(self) -> Optional[str]:
         if not self.dtek_monitor:
