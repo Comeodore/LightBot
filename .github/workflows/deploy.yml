@@ -6,7 +6,7 @@ on:
 
 jobs:
   deploy-lightbot:
-    runs-on: self-hosted
+    runs-on: my-server-node
     steps:
       - name: Update repository
         run: |

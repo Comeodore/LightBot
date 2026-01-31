@@ -33,10 +33,6 @@ class ScheduleMessageBuilder:
         return f"📅 Tomorrow ({date_str}) outages cancelled"
 
     @staticmethod
-    def tomorrow_published() -> str:
-        return "📅 Tomorrow schedule published"
-
-    @staticmethod
     def schedule_updated_with_info(day_label: str, date_str: str, info: str) -> str:
         return f"📅 {day_label} ({date_str}) schedule updated\n\n{info}"
 
@@ -237,7 +233,7 @@ class DtekScheduleMonitor:
         tomorrow_changes = self._detect_tomorrow_changes(new_state, is_new_day)
 
         if tomorrow_changes == "published":
-            await self._handle_tomorrow_published()
+            await self._handle_tomorrow_published(new_state, now)
         elif tomorrow_changes == "cancelled":
             await self._handle_tomorrow_cancelled(now, is_new_day)
         elif tomorrow_changes == "changed":
@@ -269,10 +265,12 @@ class DtekScheduleMonitor:
                 return "changed"
         return None
 
-    async def _handle_tomorrow_published(self) -> None:
+    async def _handle_tomorrow_published(self, new_state: ScheduleState, now: datetime) -> None:
+        info = self._get_schedule_context_info(new_state, now)
         try:
-            await self.notifier.send(self._msg.tomorrow_published())
-            logger.info("📅 Tomorrow schedule published")
+            msg = f"📅 Tomorrow schedule published\n\n{info}"
+            await self.notifier.send(msg)
+            logger.info(f"📅 Tomorrow schedule published: {info}")
         except Exception as e:
             logger.error(f"Failed to send tomorrow published notification: {e}")
 
@@ -325,12 +323,12 @@ class DtekScheduleMonitor:
         if self.power_monitor.is_power_off():
             slot_end = formatter.get_slot_end()
             if slot_end:
-                return f"🕐 Current outage ends: *{slot_end}*"
+                return f"⚡ Current outage ends: *{slot_end}*"
             return "⚠️ Outage end unknown"
         else:
             next_outage = formatter.get_outage_string(power_is_off=False)
             if next_outage:
-                return f"⚡ Next outage: *{next_outage}*"
+                return f"🕐 Next outage: *{next_outage}*"
             return "✅ No scheduled outages"
 
     @staticmethod
