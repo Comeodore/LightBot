@@ -46,17 +46,14 @@ class ScheduleMessageBuilder:
 
     @staticmethod
     def emergency_detected(restoration_time: str) -> str:
-        msg = "⚡ *Scheduled outage detected*"
+        msg = "🚨 *Emergency detected*"
         if restoration_time:
             msg += f"\n\n🕐 Restoration: *{restoration_time}*"
         return msg
 
     @staticmethod
-    def outage_type_detected(outage_type: str, restoration_time: str) -> str:
-        msg = f"⚡ *{outage_type} detected*"
-        if restoration_time:
-            msg += f"\n\n🕐 Restoration: *{restoration_time}*"
-        return msg
+    def emergency_cancelled() -> str:
+        return "✅ Emergency cancelled"
 
 
 class DtekScheduleMonitor:
@@ -175,23 +172,32 @@ class DtekScheduleMonitor:
         )
 
     async def _check_outage_changes(self, new_state: ScheduleState) -> None:
-        # Log status mismatch when data changes
         self._log_status_mismatch_if_changed(new_state)
-        
+
+        old_outage = self._state.current_outage
+        new_outage = new_state.current_outage
+
+        was_emergency = old_outage and old_outage.is_emergency
+        is_emergency = new_outage and new_outage.is_emergency
+
+        if is_emergency and not was_emergency:
+            await self._notify_emergency_detected(new_outage)
+        elif was_emergency and not is_emergency:
+            await self._notify_emergency_cancelled()
+        elif is_emergency and was_emergency:
+            if self.power_monitor.is_power_off():
+                await self._check_restoration_time_update(old_outage, new_outage)
+
         if not self.power_monitor.is_power_off():
             return
 
-        had_outage = self._state.current_outage and self._state.current_outage.is_outage
-        has_outage = new_state.current_outage and new_state.current_outage.is_outage
+        was_scheduled = old_outage and old_outage.is_scheduled
+        is_scheduled = new_outage and new_outage.is_scheduled
 
-        if has_outage and not had_outage:
-            await self._handle_new_outage_info(new_state.current_outage)
-            return
-
-        if has_outage and had_outage:
-            await self._handle_outage_info_update(
-                self._state.current_outage, new_state.current_outage, new_state
-            )
+        if is_scheduled and not was_scheduled:
+            await self._handle_scheduled_outage_info(new_outage)
+        elif is_scheduled and was_scheduled:
+            await self._check_restoration_time_update(old_outage, new_outage)
 
     def _log_status_mismatch_if_changed(self, new_state: ScheduleState) -> None:
         # Only log when outage data actually changes
@@ -207,23 +213,39 @@ class DtekScheduleMonitor:
         elif not power_is_off and site_has_outage:
             logger.info(f"⚠️ Status mismatch: power ON but site shows '{site_status}', last updated: {new_state.current_outage.last_updated}")
 
-    async def _handle_new_outage_info(self, outage: DtekCurrentOutage) -> None:
+    async def _notify_emergency_detected(self, outage: DtekCurrentOutage) -> None:
         try:
-            if outage.is_emergency:
-                await self.notifier.send(
-                    self._msg.emergency_detected(outage.restoration_time)
-                )
-                logger.info(f"🚨 Emergency detected: restoration_time={outage.restoration_time}")
-            elif outage.is_scheduled:
-                if self._restoration_differs_from_schedule(outage.restoration_time):
-                    await self.notifier.send(
-                        self._msg.restoration_time_updated(outage.restoration_time)
-                    )
-                    logger.info(f"⚡️ Scheduled outage restoration differs: {outage.restoration_time}")
-                else:
-                    logger.info(f"⚡️ Scheduled outage matches schedule, no notification")
+            await self.notifier.send(self._msg.emergency_detected(outage.restoration_time))
+            logger.info(f"🚨 Emergency detected: restoration_time={outage.restoration_time}")
         except Exception as e:
-            logger.error(f"Failed to send outage notification: {e}")
+            logger.error(f"Failed to send emergency notification: {e}")
+
+    async def _notify_emergency_cancelled(self) -> None:
+        try:
+            await self.notifier.send(self._msg.emergency_cancelled())
+            logger.info("✅ Emergency cancelled")
+        except Exception as e:
+            logger.error(f"Failed to send emergency cancelled notification: {e}")
+
+    async def _handle_scheduled_outage_info(self, outage: DtekCurrentOutage) -> None:
+        if self._restoration_differs_from_schedule(outage.restoration_time):
+            try:
+                await self.notifier.send(self._msg.restoration_time_updated(outage.restoration_time))
+                logger.info(f"⚡️ Scheduled outage restoration differs: {outage.restoration_time}")
+            except Exception as e:
+                logger.error(f"Failed to send restoration notification: {e}")
+        else:
+            logger.info("⚡️ Scheduled outage matches schedule, no notification")
+
+    async def _check_restoration_time_update(
+        self, old_outage: DtekCurrentOutage, new_outage: DtekCurrentOutage
+    ) -> None:
+        if old_outage.restoration_time != new_outage.restoration_time:
+            try:
+                await self.notifier.send(self._msg.restoration_time_updated(new_outage.restoration_time))
+                logger.info(f"🔄 Restoration time changed: {new_outage.restoration_time}")
+            except Exception as e:
+                logger.error(f"Failed to send restoration time update: {e}")
 
     def _restoration_differs_from_schedule(self, restoration_time: str) -> bool:
         if not restoration_time:
@@ -238,21 +260,6 @@ class DtekScheduleMonitor:
             return True
 
         return restoration_time not in slot_end and slot_end not in restoration_time
-
-    async def _handle_outage_info_update(
-        self,
-        old_outage: DtekCurrentOutage,
-        new_outage: DtekCurrentOutage,
-        new_state: ScheduleState,
-    ) -> None:
-        if old_outage.restoration_time != new_outage.restoration_time:
-            try:
-                await self.notifier.send(
-                    self._msg.restoration_time_updated(new_outage.restoration_time)
-                )
-                logger.info(f"🔄 Restoration time changed: {new_outage.restoration_time}")
-            except Exception as e:
-                logger.error(f"Failed to send restoration time update: {e}")
 
     async def _handle_schedule_changes(self, new_state: ScheduleState, now: datetime) -> None:
         is_new_day = self._is_new_day(new_state)
