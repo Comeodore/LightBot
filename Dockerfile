@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY config.py .
 COPY bot.py .
+COPY heartbeat.py .
 COPY models/ models/
 COPY services/ services/
 COPY monitors/ monitors/

@@ -3,6 +3,7 @@ import logging
 import signal
 
 from config import Config
+from heartbeat import heartbeat_task
 from monitors.power import PowerMonitor
 
 logging.basicConfig(
@@ -26,6 +27,9 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, monitor.shutdown)
+
+    # liveness heartbeat for the services health monitor (runs on this loop)
+    asyncio.create_task(heartbeat_task(service_id="lightbot"))
 
     try:
         await monitor.run()
